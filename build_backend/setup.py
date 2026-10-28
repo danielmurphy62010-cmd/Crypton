@@ -25,7 +25,7 @@ else:
 
 extension = Extension(
     name=CONFIG["module_name"],
-    sources=[str(ROOT / source) for source in CONFIG["sources"]],
+    sources=[str(ROOT / ".." / source) for source in CONFIG["sources"]],
     include_dirs=[pybind11.get_include()],
     libraries=CONFIG["windows_libraries"] if IS_WINDOWS else CONFIG["unix_libraries"],
     language="c++",
