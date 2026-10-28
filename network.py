@@ -71,7 +71,7 @@ class TCPServer:
                 except Exception:pass
             threading.Timer(30.0, clear_console).start()
         self._lock = threading.RLock()
-        self._backend = backend.Server(host, port, handshake_worker=self._hs_worker, on_exchange=self._backend_on_exchange, on_disconnect=self.close_client, simult_handshakes=simult_handshakes, simult_exchanges=simult_exchanges)
+        self._backend = backend.Server(host, port, handshake_worker=self._hs_worker, on_exchange=self._backend_on_exchange, on_disconnect=self._backend_on_disconnect, simult_handshakes=simult_handshakes, simult_exchanges=simult_exchanges)
         self._keys = {}
         self._counters = {}
         self._admin = {}
@@ -244,9 +244,7 @@ class TCPServer:
         self._admin_send_json({"status": "ok", "users": sorted(users)},eid,cid)
     def list_connections(self, cid, eid):
         self._admin_require(cid)
-        with self._lock:
-            for cid in self._keys:print(cid)
-            connections = [{"cid": client_id.hex() if isinstance(client_id, bytes) else str(client_id),"username": self._usernames[client_id],} for client_id in self._keys if client_id in self._usernames]
+        with self._lock:connections = [{"cid": client_id.hex() if isinstance(client_id, bytes) else str(client_id),"username": self._usernames[client_id],} for client_id in self._keys if client_id in self._usernames]
         connections.sort(key=lambda client: client["username"].lower())
         self._admin_send_json({"status": "ok", "connections": connections},eid,cid)
     def rename_username(self, cid, eid, target_cid, new_username):
@@ -312,6 +310,8 @@ class TCPServer:
         with self._lock:self._usernames.pop(target_cid, None)
         self.close_client(target_cid)
         self._admin_send_json({"status": "ok", "disconnected": True},eid,cid)
+    def _backend_on_disconnect(self, client_id):
+        self.close_client(client_id,False)
     def _backend_on_exchange(self, cid, eid):
         try:
             data = self.recv(cid, eid=eid, timeout=1)
@@ -344,8 +344,9 @@ class TCPServer:
             if counter <= rc:raise ProtocolError("Counter Error")
             self._counters[client_id][1] = counter
         return data
-    def close_client(self, client_id):
-        try:self._backend.close_client(client_id)
+    def close_client(self, client_id, close=True):
+        try:
+            if close:self._backend.close_client(client_id)
         finally:
             with self._lock:
                 self._keys.pop(client_id, None)
