@@ -54,6 +54,7 @@ class TCPServer:
         self.on_exchange = on_exchange
         self.newTOTP = newTOTP
         self.last_bootstrap=0
+        self.last_admin=0
         self._enable_bootstrap = False
         self.at_rest_key = _derive_at_rest_key(password, "./server_salt.bin")
         validate_auth_keys(self.auth_key_dir, self.at_rest_key)
@@ -88,11 +89,12 @@ class TCPServer:
             client_temp_pub = self._recv_handshake(temp_cid, timeout=STD_TIMEOUT)
             if client_temp_pub is None:raise ProtocolError("Handshake timed out")
             if client_temp_pub.startswith(b"REQ_ADMIN"):
+                if time.time() - self.last_admin < 30:raise ProtocolError("Admin authentication is on cooldown")
                 is_admin = True
                 client_init_pub = client_temp_pub[len(b"REQ_ADMIN"):]
             elif client_temp_pub.startswith(b"REQ_KEY"):
                 if not self._enable_bootstrap:raise ProtocolError("Bootstrap authentication is disabled")
-                if time.time() - self.last_bootstrap < 45:raise ProtocolError("Bootstrap authentication is on cooldown")
+                if time.time() - self.last_bootstrap < 30:raise ProtocolError("Bootstrap authentication is on cooldown")
                 is_bootstrap = True
                 client_init_pub = client_temp_pub[7:]
             else:client_init_pub = client_temp_pub
@@ -120,41 +122,25 @@ class TCPServer:
             if is_admin or is_bootstrap:
                 tss_salt = os.urandom(64)
                 self._send_handshake(temp_cid, init_key[1] + tss_salt)
-                totp_info = recv_enc()
-                salt=totp_info[:32]
-                hashed_totp=totp_info[32:]
-                current_time = time.time()
-                totp_code = None
-                totp_path = (self.admin_totp_path if is_admin else self.bootstrap_totp_path)
-                with open(totp_path, "rb") as f:totp_secret_bytes = Encryption.decryptGCM(f.read(), self.at_rest_key)
-                base32_secret = base64.b32encode(totp_secret_bytes).decode("utf-8")
-                totp = pyotp.TOTP(base32_secret)
-                for offset in range(-1, 2):
-                    candidate = totp.at(current_time + offset * 30)
-                    candidate_hash = Encryption.kdf_fast(util.str_to_bytes(candidate), salt)
-                    if hmac.compare_digest(candidate_hash, hashed_totp):totp_code = candidate
-                if totp_code is None:raise ProtocolError("Invalid TOTP code")
+                with open((self.admin_totp_path if is_admin else self.bootstrap_totp_path), "rb") as f:code=pyotp.TOTP(base64.b32encode(Encryption.decryptGCM(f.read(), self.at_rest_key)).decode("utf-8")).now()
                 if is_bootstrap:self.last_bootstrap = time.time()
-                tss = Encryption.kdf(util.str_to_bytes(totp_code),tss_salt + tss,5)
-                send_enc(b'')
+                else:self.last_admin = time.time()
+                tss = Encryption.kdf(util.str_to_bytes(code),tss_salt + tss,5)
+                nonce1 = os.urandom(32)
+                send_enc(nonce1)
+                nonce2 = recv_enc(1)
+                if recv_enc(1) != Encryption.basic_kdf(nonce1+nonce2, b"", 64):raise ProtocolError("Auth Failed")
                 if is_admin:
                     ekey = tss
                     ekey_defined = True
                     _hash = temp_cid
                 elif is_bootstrap:
-                    nonce = os.urandom(64)
-                    send_enc(nonce)
-                    nonce = Encryption.basic_kdf(nonce, b"", 64)
-                    if recv_enc() != nonce:raise ProtocolError("Auth Failed")
-                    send_enc(Encryption.basic_kdf(nonce, b"", 64))
                     prv_b, pub_b = Encryption.gen_x25519(True)
                     send_enc(pub_b)
                     if recv_enc() != b"1":raise ProtocolError("Client rejected auth key")
                     fid = os.urandom(16).hex()
-                    prv = os.path.join(self.auth_key_dir, fid + ".prv")
-                    pub = os.path.join(self.auth_key_dir, fid + ".pub")
-                    with open(prv, "wb") as f:f.write(Encryption.encryptGCM(prv_b, self.at_rest_key))
-                    with open(pub, "wb") as f:f.write(Encryption.encryptGCM(pub_b, self.at_rest_key))
+                    with open(os.path.join(self.auth_key_dir, fid + ".prv"), "wb") as f:f.write(Encryption.encryptGCM(prv_b, self.at_rest_key))
+                    with open(os.path.join(self.auth_key_dir, fid + ".pub"), "wb") as f:f.write(Encryption.encryptGCM(pub_b, self.at_rest_key))
             else:self._send_handshake(temp_cid, init_key[1])
             if not is_admin:
                 _hash = recv_enc(STD_TIMEOUT * 2)
@@ -171,11 +157,10 @@ class TCPServer:
                 with open(auth_file[:-4] + ".prv", "rb") as f:raw_prv = Encryption.decryptGCM(f.read(), self.at_rest_key)
                 ekey = Encryption.kdf_fast(Encryption.shared_secret(raw_prv, recv_enc()),tss)
                 ekey_defined = True
-            nonce = os.urandom(64)
-            send_enc(nonce)
-            nonce = Encryption.basic_kdf(nonce, b"", 64)
-            if recv_enc() != nonce:raise ProtocolError("Auth Failed")
-            send_enc(Encryption.basic_kdf(nonce, b"", 64))
+                nonce = os.urandom(64)
+                send_enc(nonce)
+                nonce = Encryption.basic_kdf(nonce, b"", 64)
+                if recv_enc(1) != nonce:raise ProtocolError("Auth Failed")
             with self._lock:
                 self._keys[_hash] = ekey
                 self._counters[_hash] = [sc, rc]
@@ -342,8 +327,7 @@ class TCPServer:
             self._counters[client_id][0] += 1
         if eid is None:eid = _new_eid()
         ctr = sc.to_bytes(8, "big")
-        encrypted = ctr + Encryption.encryptGCM(payload, ekey, aad=eid + ctr + b"1")
-        return self._backend.send(encrypted, client_id, eid=eid)
+        return self._backend.send(ctr + Encryption.encryptGCM(payload, ekey, aad=eid + ctr + b"1"), client_id, eid=eid)
     def recv(self, client_id, eid, timeout=MAX_TIMEOUT):
         if not isinstance(eid, bytes) or len(eid) != EID_SIZE:raise ValueError("eid must be exactly 8 bytes")
         with self._lock:
@@ -353,11 +337,12 @@ class TCPServer:
         if raw is None:return None
         ctr = raw[:8]
         counter = int.from_bytes(ctr, "big")
+        data=Encryption.decryptGCM(raw[8:], ekey, aad=eid + ctr + b"0")
         with self._lock:
             sc, rc = self._counters[client_id]
             if counter <= rc:raise ProtocolError("Counter Error")
             self._counters[client_id][1] = counter
-        return Encryption.decryptGCM(raw[8:], ekey, aad=eid + ctr + b"0")
+        return data
     def close_client(self, client_id):
         try:self._backend.close_client(client_id)
         finally:
@@ -426,30 +411,20 @@ class TCPClient:
             if response is None:raise ProtocolError("Handshake timed out")
             pub_len = len(init_key[1])
             if len(response) != pub_len + 64:raise ProtocolError("Invalid admin handshake")
-            server_init_pub = response[:-64]
-            salt = os.urandom(32)
-            tss_salt = response[-64:]
-            tss = Encryption.shared_secret(init_key[0], server_init_pub)
-            totp_code = self.admin_auth_code
-            _send_enc(salt + Encryption.kdf_fast(totp_code.encode("utf-8"), salt))
-            tss = Encryption.kdf(util.str_to_bytes(totp_code),tss_salt + tss,5)
-            _recv_enc(STD_TIMEOUT * 2)
+            tss = Encryption.kdf(util.str_to_bytes(self.admin_auth_code),response[-64:] + Encryption.shared_secret(init_key[0], response[:-64]),5)
+            nonce2=os.urandom(32)
+            _send_enc(nonce2)
+            _send_enc(Encryption.basic_kdf(_recv_enc(1)+nonce2, b"", 64))
             self.ekey = tss
             ekey_defined = True
         elif is_bootstrap:
             self._send_handshake(b"REQ_KEY" + init_key[1])
             response = self._recv_handshake(timeout=STD_TIMEOUT)
             if response is None:raise ProtocolError("Handshake timed out")
-            server_init_pub = response[:len(init_key[1])]
-            salt = os.urandom(32)
-            tss_salt = response[-64:]
-            tss = Encryption.shared_secret(init_key[0], server_init_pub)
-            _send_enc(salt + Encryption.kdf_fast(totp_code.encode("utf-8"), salt))
-            tss = Encryption.kdf(util.str_to_bytes(totp_code),tss_salt + tss,5)
-            _recv_enc(STD_TIMEOUT * 2)
-            nonce = Encryption.basic_kdf(_recv_enc(), b"", 64)
-            _send_enc(nonce)
-            if _recv_enc(STD_TIMEOUT) != Encryption.basic_kdf(nonce, b"", 64):raise ProtocolError("Auth Failed")
+            tss = Encryption.kdf(util.str_to_bytes(totp_code),response[-64:] + Encryption.shared_secret(init_key[0], response[:len(init_key[1])]),5)
+            nonce2=os.urandom(32)
+            _send_enc(nonce2)
+            _send_enc(Encryption.basic_kdf(_recv_enc(1)+nonce2, b"", 64))
             auth_pub = _recv_enc()
             _send_enc(b"1")
             salt_rest = os.urandom(SALT_SIZE)
@@ -476,9 +451,8 @@ class TCPClient:
             _send_enc(keys[1])
             self.ekey = Encryption.kdf_fast(Encryption.shared_secret(keys[0], pub_key), tss)
             ekey_defined = True
-        nonce = Encryption.basic_kdf(_recv_enc(), b"", 64)
-        _send_enc(nonce)
-        if _recv_enc() != Encryption.basic_kdf(nonce, b"", 64):raise ProtocolError("Auth Failed")
+            nonce = Encryption.basic_kdf(_recv_enc(1), b"", 64)
+            _send_enc(nonce)
         self._backend.auth_finished()
     def send(self, payload, eid=None):
         if eid is not None and (not isinstance(eid, bytes) or len(eid) != EID_SIZE):raise ValueError("eid must be exactly 8 bytes")
