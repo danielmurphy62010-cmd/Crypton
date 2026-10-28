@@ -9,7 +9,7 @@ import pybind11
 from setuptools import Extension, setup
 
 ROOT = Path(__file__).resolve().parent
-CONFIG = json.loads((ROOT / "build_backend" / "build_config.json").read_text(encoding="utf-8"))
+CONFIG = json.loads((ROOT / "build_config.json").read_text(encoding="utf-8"))
 IS_WINDOWS = os.name == "nt"
 COMPILER = "msvc" if IS_WINDOWS else "unix"
 CXX_STANDARD = int(CONFIG.get("cxx_standard", 17))
