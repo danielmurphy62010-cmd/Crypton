@@ -3,8 +3,7 @@ from zxcvbn import zxcvbn
 try:Encryption.decryptGCM(b"X" * 100, b"X" * 100)
 except Exception as e:DecryptionError = type(e)
 SALT_SIZE = 64
-STD_TIMEOUT = 5.0
-MAX_TIMEOUT = 60
+MAX_TIMEOUT = 10
 EID_SIZE = 8
 class ProtocolError(Exception):pass
 def _new_eid():return os.urandom(EID_SIZE)
@@ -72,7 +71,7 @@ class TCPServer:
                 except Exception:pass
             threading.Timer(30.0, clear_console).start()
         self._lock = threading.RLock()
-        self._backend = backend.Server(host, port, handshake_worker=self._hs_worker, on_exchange=self._backend_on_exchange, simult_handshakes=simult_handshakes, simult_exchanges=simult_exchanges)
+        self._backend = backend.Server(host, port, handshake_worker=self._hs_worker, on_exchange=self._backend_on_exchange, on_disconnect=self.close_client, simult_handshakes=simult_handshakes, simult_exchanges=simult_exchanges)
         self._keys = {}
         self._counters = {}
         self._admin = {}
@@ -81,12 +80,12 @@ class TCPServer:
         self._backend.start()
     def start(self):self._backend.start()
     def _send_handshake(self, temp_cid, data):self._backend.send_handshake(temp_cid, data)
-    def _recv_handshake(self, temp_cid, timeout=STD_TIMEOUT):return self._backend.recv_handshake(temp_cid, timeout=timeout)
+    def _recv_handshake(self, temp_cid, timeout=1):return self._backend.recv_handshake(temp_cid, timeout=timeout)
     def _hs_worker(self, temp_cid):
         is_bootstrap = False
         is_admin = False
         try:
-            client_temp_pub = self._recv_handshake(temp_cid, timeout=STD_TIMEOUT)
+            client_temp_pub = self._recv_handshake(temp_cid, timeout=1)
             if client_temp_pub is None:raise ProtocolError("Handshake timed out")
             if client_temp_pub.startswith(b"REQ_ADMIN"):
                 if time.time() - self.last_admin < 30:raise ProtocolError("Admin authentication is on cooldown")
@@ -108,7 +107,7 @@ class TCPServer:
                 sc += 1
                 if ekey_defined:self._send_handshake(temp_cid,ctr + Encryption.encryptGCM(data, ekey, aad=ctr + b"1"))
                 else:self._send_handshake(temp_cid,ctr + Encryption.encryptGCM(data, tss, aad=ctr + b"1"))
-            def recv_enc(timeout=STD_TIMEOUT):
+            def recv_enc(timeout=1):
                 nonlocal rc, ekey_defined
                 payload = self._recv_handshake(temp_cid, timeout=timeout)
                 if payload is None:raise ProtocolError("Timed out")
@@ -143,7 +142,7 @@ class TCPServer:
                     with open(os.path.join(self.auth_key_dir, fid + ".pub"), "wb") as f:f.write(Encryption.encryptGCM(pub_b, self.at_rest_key))
             else:self._send_handshake(temp_cid, init_key[1])
             if not is_admin:
-                _hash = recv_enc(STD_TIMEOUT * 2)
+                _hash = recv_enc(7.5)
                 auth_file = ""
                 for filename in os.listdir(self.auth_key_dir):
                     if not filename.endswith(".pub"):continue
@@ -245,7 +244,9 @@ class TCPServer:
         self._admin_send_json({"status": "ok", "users": sorted(users)},eid,cid)
     def list_connections(self, cid, eid):
         self._admin_require(cid)
-        with self._lock:connections = [{"cid": client_id.hex() if isinstance(client_id, bytes) else str(client_id),"username": self._usernames[client_id],} for client_id in self._keys if client_id in self._usernames]
+        with self._lock:
+            for cid in self._keys:print(cid)
+            connections = [{"cid": client_id.hex() if isinstance(client_id, bytes) else str(client_id),"username": self._usernames[client_id],} for client_id in self._keys if client_id in self._usernames]
         connections.sort(key=lambda client: client["username"].lower())
         self._admin_send_json({"status": "ok", "connections": connections},eid,cid)
     def rename_username(self, cid, eid, target_cid, new_username):
@@ -313,7 +314,7 @@ class TCPServer:
         self._admin_send_json({"status": "ok", "disconnected": True},eid,cid)
     def _backend_on_exchange(self, cid, eid):
         try:
-            data = self.recv(cid, eid=eid, timeout=STD_TIMEOUT)
+            data = self.recv(cid, eid=eid, timeout=1)
             if data is None:return
             if self.on_exchange is not None:self.on_exchange(self, eid, data, cid)
         except Exception:traceback.print_exc()
@@ -376,7 +377,7 @@ class TCPClient:
             self.close()
             raise
     def _send_handshake(self, payload):self._backend.send_handshake(payload)
-    def _recv_handshake(self, timeout=STD_TIMEOUT):return self._backend.recv_handshake(timeout=timeout)
+    def _recv_handshake(self, timeout=1):return self._backend.recv_handshake(timeout=timeout)
     def _authenticate(self, password, auth_key, auth_key_code_callback):
         is_admin = isinstance(self.admin_auth_code, str)
         is_bootstrap = not is_admin and not os.path.exists(auth_key)
@@ -392,7 +393,7 @@ class TCPClient:
             self.sc += 1
             if ekey_defined:self._send_handshake(ctr + Encryption.encryptGCM(payload, self.ekey, aad=ctr + b"0"))
             else:self._send_handshake(ctr + Encryption.encryptGCM(payload, tss, aad=ctr + b"0"))
-        def _recv_enc(timeout=STD_TIMEOUT):
+        def _recv_enc(timeout=1):
             nonlocal ekey_defined
             payload = self._recv_handshake(timeout=timeout)
             if payload is None:raise ProtocolError("Timed out")
@@ -407,7 +408,7 @@ class TCPClient:
         if is_admin:
             if not self.admin_auth_code:raise ValueError("admin_auth_code must not be empty")
             self._send_handshake(b"REQ_ADMIN" + init_key[1])
-            response = self._recv_handshake(timeout=STD_TIMEOUT)
+            response = self._recv_handshake(timeout=1)
             if response is None:raise ProtocolError("Handshake timed out")
             pub_len = len(init_key[1])
             if len(response) != pub_len + 64:raise ProtocolError("Invalid admin handshake")
@@ -419,7 +420,7 @@ class TCPClient:
             ekey_defined = True
         elif is_bootstrap:
             self._send_handshake(b"REQ_KEY" + init_key[1])
-            response = self._recv_handshake(timeout=STD_TIMEOUT)
+            response = self._recv_handshake(timeout=1)
             if response is None:raise ProtocolError("Handshake timed out")
             tss = Encryption.kdf(util.str_to_bytes(totp_code),response[-64:] + Encryption.shared_secret(init_key[0], response[:len(init_key[1])]),5)
             nonce2=os.urandom(32)
@@ -435,7 +436,7 @@ class TCPClient:
             pub_key = auth_pub
         else:
             self._send_handshake(init_key[1])
-            server_init_pub = self._recv_handshake(timeout=STD_TIMEOUT)
+            server_init_pub = self._recv_handshake(timeout=1)
             if server_init_pub is None:raise ProtocolError("Handshake timed out")
             tss = Encryption.shared_secret(init_key[0], server_init_pub)
             with open(auth_key, "rb") as f:
@@ -480,7 +481,7 @@ class TCPClient:
         return Encryption.decryptGCM(raw[8:], ekey, aad=eid + ctr + b"1")
     def _backend_on_exchange(self, eid):
         try:
-            data = self.recv(eid, timeout=STD_TIMEOUT)
+            data = self.recv(eid, timeout=1)
             if data is None:return
             if self.on_exchange is not None:self.on_exchange(self, eid, data)
         except Exception:traceback.print_exc()

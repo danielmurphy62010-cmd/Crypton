@@ -385,6 +385,7 @@ struct Conn {
     std::atomic<bool> closed{false};
     std::atomic<bool> backpressure{false};
     std::atomic<bool> handshake_started{false};
+    std::atomic<bool> disconnect_notified{false};
     std::string temp_cid;
     std::string cid;
     std::string magic1;
@@ -751,13 +752,15 @@ class Server {
 public:
     Server(std::string host, uint16_t port, py::object handshake_worker,
            py::object on_exchange, size_t simultaneous_handshakes,
-           size_t simultaneous_exchanges)
+           size_t simultaneous_exchanges, py::object on_disconnect)
         : host_(std::move(host)),
           port_(port),
           handshake_worker_(std::move(handshake_worker)),
           on_exchange_(std::move(on_exchange)),
+          on_disconnect_(std::move(on_disconnect)),
           has_handshake_worker_(!handshake_worker_.is_none()),
           has_on_exchange_(!on_exchange_.is_none()),
+          has_on_disconnect_(!on_disconnect_.is_none()),
           global_memory_(std::make_shared<Quota>(MAX_GLOBAL_BUFFERED_BYTES)),
           handshakes_(simultaneous_handshakes),
           exchanges_(simultaneous_exchanges) {
@@ -766,6 +769,8 @@ public:
         do {
             magic2_ = random_bytes(MAGIC_N);
         } while (magic1_ == magic2_);
+        if (has_on_disconnect_)
+            disconnect_thread_ = std::thread([this] { disconnect_loop(); });
     }
     ~Server() {
         if (PyGILState_Check()) {
@@ -843,7 +848,10 @@ public:
             std::lock_guard<std::mutex> lock(connections_mutex_);
             remaining.swap(connections_);
         }
-        for (const auto& conn : remaining) clear_conn_io_state(conn);
+        for (const auto& conn : remaining) {
+            queue_disconnect(conn);
+            clear_conn_io_state(conn);
+        }
         {
             std::lock_guard<std::mutex> lock(ids_mutex_);
             ids_.clear();
@@ -853,6 +861,7 @@ public:
         peer_accepts_.clear();
         handshakes_.stop();
         exchanges_.stop();
+        stop_disconnect_worker();
     }
     py::bytes MAGIC1() const { return as_bytes(magic1_); }
     py::bytes MAGIC2() const { return as_bytes(magic2_); }
@@ -1379,6 +1388,63 @@ private:
         conn->closed = true;
         conn->cv.notify_all();
     }
+    void queue_disconnect(const std::shared_ptr<Conn>& conn) noexcept {
+        if (!has_on_disconnect_ || !conn ||
+            !conn->authed.load(std::memory_order_acquire) || conn->cid.empty())
+            return;
+        try {
+            {
+                std::lock_guard<std::mutex> lock(disconnect_mutex_);
+                if (disconnect_worker_stopping_ ||
+                    conn->disconnect_notified.load(std::memory_order_acquire))
+                    return;
+                disconnect_queue_.push_back(conn->cid);
+                conn->disconnect_notified.store(true, std::memory_order_release);
+            }
+            disconnect_cv_.notify_one();
+        } catch (const std::exception& e) {
+            log_callback_error("on_disconnect", e.what());
+        } catch (...) {
+            log_callback_error("on_disconnect", "failed to queue disconnect callback");
+        }
+    }
+    void disconnect_loop() noexcept {
+        for (;;) {
+            std::string id;
+            {
+                std::unique_lock<std::mutex> lock(disconnect_mutex_);
+                disconnect_cv_.wait(lock, [&] {
+                    return disconnect_worker_stopping_ || !disconnect_queue_.empty();
+                });
+                if (disconnect_queue_.empty() && disconnect_worker_stopping_) return;
+                id = std::move(disconnect_queue_.front());
+                disconnect_queue_.pop_front();
+            }
+            try {
+                py::gil_scoped_acquire acquire;
+                on_disconnect_(as_bytes(id));
+            } catch (py::error_already_set& e) {
+                log_callback_error("on_disconnect", e.what());
+            } catch (const std::exception& e) {
+                log_callback_error("on_disconnect", e.what());
+            } catch (...) {
+                log_callback_error("on_disconnect", "unknown exception");
+            }
+        }
+    }
+    void stop_disconnect_worker() {
+        {
+            std::lock_guard<std::mutex> lock(disconnect_mutex_);
+            disconnect_worker_stopping_ = true;
+        }
+        disconnect_cv_.notify_all();
+        if (disconnect_thread_.joinable()) {
+            if (disconnect_thread_.get_id() == std::this_thread::get_id())
+                disconnect_thread_.detach();
+            else
+                disconnect_thread_.join();
+        }
+    }
     void cleanup_closed() {
         std::vector<std::shared_ptr<Conn>> dead;
         {
@@ -1394,6 +1460,7 @@ private:
             }
         }
         for (const auto& conn : dead) {
+            queue_disconnect(conn);
             {
                 std::lock_guard<std::mutex> lock(ids_mutex_);
                 for (auto it = ids_.begin(); it != ids_.end();) {
@@ -1521,8 +1588,15 @@ private:
     std::string magic2_;
     py::object handshake_worker_;
     py::object on_exchange_;
+    py::object on_disconnect_;
     bool has_handshake_worker_;
     bool has_on_exchange_;
+    bool has_on_disconnect_;
+    std::mutex disconnect_mutex_;
+    std::condition_variable disconnect_cv_;
+    std::deque<std::string> disconnect_queue_;
+    bool disconnect_worker_stopping_ = false;
+    std::thread disconnect_thread_;
     std::shared_ptr<Quota> global_memory_;
     Pool handshakes_;
     Pool exchanges_;
@@ -2060,12 +2134,13 @@ PYBIND11_MODULE(backend, m) {
     m.attr("MAX_AUTH_PAYLOAD") = MAX_AUTH;
     m.attr("QUEUE_LIMIT") = QUEUE_LIMIT;
     py::class_<Server>(m, "Server")
-        .def(py::init<std::string, uint16_t, py::object, py::object, size_t, size_t>(),
+        .def(py::init<std::string, uint16_t, py::object, py::object, size_t, size_t, py::object>(),
              py::arg("host"), py::arg("port"),
              py::arg("handshake_worker") = py::none(),
              py::arg("on_exchange") = py::none(),
              py::arg("simult_handshakes") = 4,
-             py::arg("simult_exchanges") = 4)
+             py::arg("simult_exchanges") = 4,
+             py::arg("on_disconnect") = py::none())
         .def("start", &Server::start)
         .def("stop", [](Server& s) { py::gil_scoped_release release; s.stop(); })
         .def("send", [](Server& s, py::bytes data, py::bytes cid, py::object eid) {
