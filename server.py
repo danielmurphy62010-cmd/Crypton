@@ -235,7 +235,7 @@ class FileServer:
                     return
             if cmd == "list":
                 rel_path = meta.get("path", "")
-                target = safe_path(self.shared_dir, rel_path)
+                target = safe_path(self.shared_dir, rel_path, True)
                 if not os.path.exists(target):resp = make_packet({"status": "error","message": "Directory does not exist",})
                 elif not os.path.isdir(target):resp = make_packet({"status": "error","message": "Path is not a directory",})
                 else:

@@ -273,7 +273,9 @@ def admin_request(client, cmd, **fields):
     return meta
 def admin_console(client):
     def ask(prompt):return input(prompt).strip()
-    def clear_screen():os.system("cls" if os.name == "nt" else "clear")
+    def clear_screen():
+        # return
+        os.system("cls" if os.name == "nt" else "clear")
     def show_connections():
         result = admin_request(client, "admin_list_connections")
         connections = result.get("connections", [])

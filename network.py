@@ -126,9 +126,11 @@ class TCPServer:
                 else:self.last_admin = time.time()
                 tss = Encryption.kdf(util.str_to_bytes(code),tss_salt + tss,5)
                 nonce1 = os.urandom(32)
-                send_enc(nonce1)
-                nonce2 = recv_enc(1)
-                if recv_enc(1) != Encryption.basic_kdf(nonce1+nonce2, b"", 64):raise ProtocolError("Auth Failed")
+                self._send_handshake(temp_cid,Encryption.encrypt(nonce1, tss))
+                nonce2=Encryption.decrypt(self._recv_handshake(temp_cid, timeout=5),tss)
+                nhash=Encryption.basic_kdf(nonce1+nonce2, b"", 64)
+                if Encryption.decrypt(self._recv_handshake(temp_cid, timeout=1),tss) != nhash:raise ProtocolError("Auth Failed")
+                self._send_handshake(temp_cid,Encryption.encrypt(Encryption.basic_kdf(nhash,b'',64), tss))
                 if is_admin:
                     ekey = tss
                     ekey_defined = True
@@ -157,9 +159,10 @@ class TCPServer:
                 ekey = Encryption.kdf_fast(Encryption.shared_secret(raw_prv, recv_enc()),tss)
                 ekey_defined = True
                 nonce = os.urandom(64)
-                send_enc(nonce)
-                nonce = Encryption.basic_kdf(nonce, b"", 64)
-                if recv_enc(1) != nonce:raise ProtocolError("Auth Failed")
+                self._send_handshake(temp_cid,Encryption.encrypt(nonce, tss))
+                nhash = Encryption.basic_kdf(nonce, b"", 64)
+                if Encryption.decrypt(self._recv_handshake(temp_cid, timeout=1),tss) != nhash:raise ProtocolError("Auth Failed")
+                self._send_handshake(temp_cid,Encryption.encrypt(Encryption.basic_kdf(nhash,b'',64), tss))
             with self._lock:
                 self._keys[_hash] = ekey
                 self._counters[_hash] = [sc, rc]
@@ -308,10 +311,9 @@ class TCPServer:
         try:close_client(target_cid)
         except Exception as exc:raise ProtocolError(f"Disconnect failed: {exc}") from exc
         with self._lock:self._usernames.pop(target_cid, None)
-        self.close_client(target_cid)
+        self.close_client(target_cid,False)
         self._admin_send_json({"status": "ok", "disconnected": True},eid,cid)
-    def _backend_on_disconnect(self, client_id):
-        self.close_client(client_id,False)
+    def _backend_on_disconnect(self, client_id):self.close_client(client_id,False)
     def _backend_on_exchange(self, cid, eid):
         try:
             data = self.recv(cid, eid=eid, timeout=1)
@@ -415,8 +417,10 @@ class TCPClient:
             if len(response) != pub_len + 64:raise ProtocolError("Invalid admin handshake")
             tss = Encryption.kdf(util.str_to_bytes(self.admin_auth_code),response[-64:] + Encryption.shared_secret(init_key[0], response[:-64]),5)
             nonce2=os.urandom(32)
-            _send_enc(nonce2)
-            _send_enc(Encryption.basic_kdf(_recv_enc(1)+nonce2, b"", 64))
+            self._send_handshake(Encryption.encrypt(nonce2,tss))
+            nhash=Encryption.basic_kdf(Encryption.decrypt(self._recv_handshake(timeout=1),tss)+nonce2, b"", 64)
+            self._send_handshake(Encryption.encrypt(nhash,tss))
+            if Encryption.decrypt(self._recv_handshake(timeout=1),tss) != Encryption.basic_kdf(nhash, b"", 64):raise ProtocolError("Auth Failed")
             self.ekey = tss
             ekey_defined = True
         elif is_bootstrap:
@@ -425,8 +429,10 @@ class TCPClient:
             if response is None:raise ProtocolError("Handshake timed out")
             tss = Encryption.kdf(util.str_to_bytes(totp_code),response[-64:] + Encryption.shared_secret(init_key[0], response[:len(init_key[1])]),5)
             nonce2=os.urandom(32)
-            _send_enc(nonce2)
-            _send_enc(Encryption.basic_kdf(_recv_enc(1)+nonce2, b"", 64))
+            self._send_handshake(Encryption.encrypt(nonce2,tss))
+            nhash=Encryption.basic_kdf(Encryption.decrypt(self._recv_handshake(timeout=1),tss)+nonce2, b"", 64)
+            self._send_handshake(Encryption.encrypt(nhash,tss))
+            if Encryption.decrypt(self._recv_handshake(timeout=1),tss) != Encryption.basic_kdf(nhash, b"", 64):raise ProtocolError("Auth Failed")
             auth_pub = _recv_enc()
             _send_enc(b"1")
             salt_rest = os.urandom(SALT_SIZE)
@@ -453,8 +459,9 @@ class TCPClient:
             _send_enc(keys[1])
             self.ekey = Encryption.kdf_fast(Encryption.shared_secret(keys[0], pub_key), tss)
             ekey_defined = True
-            nonce = Encryption.basic_kdf(_recv_enc(1), b"", 64)
-            _send_enc(nonce)
+            nonce = Encryption.basic_kdf(Encryption.decrypt(self._recv_handshake(timeout=1),tss), b"", 64)
+            self._send_handshake(Encryption.encrypt(nonce,tss))
+            if Encryption.decrypt(self._recv_handshake(timeout=1),tss) != Encryption.basic_kdf(nonce, b"", 64):raise ProtocolError("Auth Failed")
         self._backend.auth_finished()
     def send(self, payload, eid=None):
         if eid is not None and (not isinstance(eid, bytes) or len(eid) != EID_SIZE):raise ValueError("eid must be exactly 8 bytes")
