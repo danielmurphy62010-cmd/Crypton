@@ -1,33 +1,36 @@
 # `Encryption.py` — Cryptographic Utilities
 
-`Encryption.py` provides Python wrappers for hashing, key derivation, symmetric encryption, key agreement, digital signatures, and X.509 certificate helpers. The application networking code uses only a few functions from module.
+`Encryption.py` collects hashing, key derivation, symmetric encryption, key agreement, digital signatures, key serialization, and certificate-generation helpers. `network.py` uses a subset of these helpers for Crypton's custom authenticated TCP protocol. The TLS certificate helper is separate from that protocol.
+
+> **Security note:** These helpers are building blocks, not a protocol security review. Prefer authenticated encryption, protect private keys, and have the full protocol reviewed before using it for high-risk data.
 
 ## Requirements
 
-Install the Python packages:
+Install the Python packages used by this module:
 
 ```bash
 python -m pip install cryptography argon2-cffi blake3
 ```
 
-The project-local `util.py` module is also imported. `blake3` is used when installed; otherwise `HASH` falls back to SHA-3/SHAKE hashing. `basic_kdf` uses BLAKE3 when available and an HKDF-SHA-512 path when it is not, so the fallback behavior is not byte-for-byte compatible with the BLAKE3 path. Use the same environment/configuration on both sides when deriving keys.
+The project-local `util.py` module is imported as well. `blake3` is optional for this module's hashing/KDF fallback, but the current `client.py` and `server.py` import `blake3` directly, so it is required to run the full application.
 
 ## API overview
 
 | Function | Purpose |
 |---|---|
-| `HASH(data, l=32, hex=False)` | Hash bytes and return a digest or hexadecimal text. Uses BLAKE3 when installed. |
-| `basic_kdf(master, salt, length=32)` | Lightweight deterministic derivation helper. It is not a password-hardening KDF. |
-| `kdf(password, salt, level=5)` | Argon2id key derivation using the configured level. |
-| `kdf_fast(password, salt)` / `kdf_slow(password, salt)` | Convenience wrappers for Argon2id levels 0 and 10. |
-| `encrypt(data, key)` / `decrypt(blob, key)` | AES-CTR encryption/decryption; provides no authentication by itself. |
-| `encryptGCM(data, key, aad=None)` / `decryptGCM(blob, key, aad=None)` | AES-GCM authenticated encryption/decryption. AAD must match during decryption. |
-| `gen_chacha20()` | Generates a 32-byte ChaCha20 key. |
-| `encrypt_chacha(data, key, auth=True)` / `decrypt_chacha(blob, key, auth=True)` | ChaCha20-Poly1305 when `auth=True`; raw ChaCha20 stream encryption when `auth=False`. |
-| `gen_x25519(overkill=False)` / `shared_secret(private, public)` | X25519 key generation/shared secret; `overkill=True` selects X448. |
-| `gen_ed25519(overkill=False)` / `ed25519_sign(private, data)` / `ed25519_verify(public, blob)` | Ed25519 signatures; `overkill=True` selects Ed448 for key generation. |
-| `generate_tls(...)` | Writes a self-signed ECDSA P-256 TLS certificate and its private key. |
-| `gen_CA(...)` | Generates CA key/certificate files. Review the implementation before using it in a production PKI. |
+| `HASH(data, l=32, hex=False)` | Hashes bytes and returns a digest or hexadecimal text. Uses BLAKE3 when installed; otherwise uses SHA-3/SHAKE fallback logic. |
+| `basic_kdf(master_pw, salt, length=32)` | Lightweight deterministic derivation helper. It is not a password-hardening KDF. |
+| `kdf(password, salt, level=5)` | Argon2id derivation; returns 512 bytes in the current implementation. |
+| `kdf_fast(password, salt)` / `kdf_slow(password, salt)` | Argon2id convenience wrappers for levels 0 and 10. |
+| `encrypt(data, key)` / `decrypt(blob, key)` | AES-CTR encryption. This format has no authentication tag and does not detect tampering. |
+| `encryptGCM(data, key, aad=None)` / `decryptGCM(blob, key, aad=None)` | AES-GCM authenticated encryption and decryption. AAD must match. |
+| `gen_chacha20()` | Generates a random 32-byte key. |
+| `encrypt_chacha(data, key, auth=True)` / `decrypt_chacha(blob, key, auth=True)` | ChaCha20-Poly1305 with `auth=True`; raw ChaCha20 stream encryption without authentication with `auth=False`. |
+| `gen_x25519(overkill=False)` / `shared_secret(private, public)` | Generates X25519 keys and derives a shared secret; `overkill=True` selects X448. |
+| `gen_ed25519(overkill=False)` / `ed25519_sign(private, data)` / `ed25519_verify(public, blob)` | Generates Ed25519 signing keys and signs/verifies data; `overkill=True` selects Ed448 for key generation. |
+| `frame_key`, `detect_key_type`, `get_pub`, `load_keys` | Encode/decode the module's tagged raw-key format and load matching asymmetric keys. |
+| `generate_tls(...)` | Writes a self-signed ECDSA P-256 TLS certificate and an unencrypted PEM private key. |
+| `gen_CA(...)` | Writes a signing key, public key, and certificate files. Review its implementation before using it as part of a production PKI. |
 
 ## Hashing and key derivation
 
@@ -39,12 +42,13 @@ payload = b"sample data"
 digest_hex = enc.HASH(payload, l=32, hex=True)
 
 salt = os.urandom(16)
-# Argon2id; kdf_fast is a convenience level, not a recommendation for every use.
-key = enc.kdf_fast(b"a user-supplied password", salt)
+key = enc.kdf(b"a user-supplied password", salt, level=5)
 assert len(digest_hex) == 64
 ```
 
-Use unique random salts for password-derived keys and store the salt with the protected ciphertext or credential material. Choose KDF cost based on the threat model and deployment performance, not the helper name alone.
+Use a unique random salt for each password-derived key and persist the salt with the material it protects. `basic_kdf` is intended for deriving subkeys from existing key material; it is not a substitute for Argon2id when hardening a human password.
+
+**Compatibility warning:** Installing or removing `blake3` changes the implementation of `HASH` and `basic_kdf`. The BLAKE3 and fallback outputs are not byte-for-byte compatible. Keep the same environment/configuration for all participants that derive or verify the same key material.
 
 ## Authenticated symmetric encryption (AES-GCM)
 
@@ -61,9 +65,15 @@ recovered = enc.decryptGCM(ciphertext, master_key, aad=associated_data)
 assert recovered == plaintext
 ```
 
-The actual function signatures are `encryptGCM(data, key, aad=None)` and `decryptGCM(encrypted, key, aad=None)`. They do **not** accept a `secure_kdf=True` parameter. Internally, the functions create a random salt and nonce, derive a subkey with `basic_kdf`, and store the nonce and salt alongside the AEAD ciphertext. The same `aad` value must be supplied when decrypting or authentication will fail.
+The signatures are `encryptGCM(data, key, aad=None)` and `decryptGCM(encrypted, key, aad=None)`. They do not accept a `secure_kdf` argument. The serialized value contains a 12-byte nonce, a 32-byte salt, and the AES-GCM ciphertext/tag. The helper derives a subkey from the supplied key and random salt. Decryption fails if the ciphertext/tag or supplied AAD is invalid.
 
-## Key exchange
+## AES-CTR and ChaCha20 caveat
+
+`encrypt()` serializes a 16-byte IV, a 32-byte salt, and the AES-CTR ciphertext. There is no authentication tag; modifications can result in modified plaintext without a reliable integrity error.
+
+`encrypt_chacha(..., auth=True)` uses ChaCha20-Poly1305 and includes a random salt and nonce. With `auth=False`, it uses raw ChaCha20 stream encryption and provides no authentication. Prefer AEAD modes for application data unless a separate, correctly designed integrity mechanism is already provided.
+
+## Key agreement
 
 ```python
 import Encryption as enc
@@ -76,7 +86,7 @@ bob_secret = enc.shared_secret(bob_private, alice_public)
 assert alice_secret == bob_secret
 ```
 
-Set `overkill=True` to select X448 in `gen_x25519`. Keep private keys private and use each shared secret only in a protocol that has appropriate authentication and key separation.
+Keys are returned in Crypton's tagged format, not as bare raw key bytes. `gen_x25519(overkill=True)` selects X448. Keep private keys secret and use derived secrets only in protocols that provide authentication and appropriate key separation.
 
 ## Digital signatures
 
@@ -90,9 +100,9 @@ verified_message = enc.ed25519_verify(public_key, signed_blob)
 assert verified_message == message
 ```
 
-The current helper serializes the signature followed by the original message. Do not parse that combined format using an assumed fixed signature length without accounting for the selected algorithm: Ed25519 uses a 64-byte signature and Ed448 uses a 114-byte signature.
+The current format is `signature || original_message`; verification returns the original message and raises if verification fails. Ed25519 signatures are 64 bytes and Ed448 signatures are 114 bytes. Do not assume a fixed signature length if handling both algorithms.
 
-## Certificate generation
+## Certificate helpers
 
 ```python
 import Encryption as enc
@@ -106,12 +116,15 @@ enc.generate_tls(
 )
 ```
 
-This helper creates a self-signed certificate; clients will not automatically trust it. The key is written unencrypted, so protect the file using filesystem permissions and encrypted storage. The supplied `network.py`/`backend.cpp` transport does not use this certificate helper; generating a certificate does not turn Crypton's custom protocol into TLS.
+`generate_tls` creates a self-signed ECDSA P-256 certificate. It returns without regenerating if both output paths already exist. The private key is written without encryption; protect it with filesystem permissions and encrypted storage. A self-signed certificate is not automatically trusted by clients.
 
-## Security notes
+The `network.py` transport uses its own signed-key handshake and AES-GCM messages. It does **not** use this X.509/TLS certificate helper, so generating a certificate does not make the Crypton transport TLS.
 
-- **Prefer authenticated encryption.** `encrypt()`/`decrypt()` use AES-CTR without an authentication tag. They do not detect ciphertext tampering. `encrypt_chacha(..., auth=False)` is also unauthenticated. Add an independently designed authentication scheme only if you understand the associated risks; otherwise use the AEAD functions.
-- **Do not use `basic_kdf` to harden weak passwords.** Use `kdf`, `kdf_fast`, or `kdf_slow` with random salts when password-hardening is required.
-- **Keep nonces and salts in their expected formats.** Do not modify the ciphertext layout or reuse nonce/key combinations with AEAD algorithms.
-- **Review fallback behavior.** Installing or removing `blake3` changes `HASH` and `basic_kdf` behavior in this implementation. Do not silently mix output from different paths for stored keys or protocol values.
-- **This is a utility module, not a security audit.** Review the code and have the complete protocol assessed before relying on it for high-risk data.
+## Security checklist
+
+- Prefer AES-GCM or ChaCha20-Poly1305 over unauthenticated AES-CTR or raw ChaCha20.
+- Do not use `basic_kdf` to harden weak passwords; use Argon2id with a unique random salt.
+- Do not reuse nonce/key combinations with AEAD algorithms.
+- Keep private keys, salts, and protected state together in reliable, access-controlled backups.
+- Treat BLAKE3-available and fallback environments as different cryptographic configurations.
+- Independently review the protocol before relying on it for sensitive or high-risk workloads.

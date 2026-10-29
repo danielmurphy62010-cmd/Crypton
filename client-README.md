@@ -1,43 +1,51 @@
-# Crypton Client
+# Crypton Client (`client.py`)
 
-`client.py` is the user-facing client for the Crypton storage server. It supports a native mount on Windows and Linux, plus a Python API for direct remote file operations.
+`client.py` provides the user-facing client and remote filesystem adapters. It mounts the remote share on Windows and Linux and exposes a Python API for direct file operations. On Windows it selects `winfuse3`; on Linux it selects the project's `vfs` adapter.
 
-> **Data handling:** Network messages are encrypted in transit, but the server writes ordinary plaintext files in its shared directory. Windows-hydrated and Linux-cached files may also exist as local plaintext.
+> **Data handling:** Messages are encrypted while travelling through Crypton's custom protocol, but `server.py` writes file content as ordinary plaintext files in the server's shared directory. Local mount/cache behavior may also create local plaintext copies.
 
 ## Requirements
 
-The client requires the common Crypton Python dependencies and the compiled `backend` extension. See [`SETUP.md`](SETUP.md) and [`backend-README.md`](backend-README.md).
+The Python components require packages including:
 
-The mount implementation depends on the platform:
+```bash
+python -m pip install cryptography argon2-cffi blake3 zxcvbn pyotp
+```
 
-- **Windows:** `winfuse3` and its filesystem dependencies. The client integrates with Windows Cloud Files API (cfAPI) for on-demand hydration.
-- **Linux:** the project's `vfs` module and compatible FUSE packages. The VFS adds local chunk caching and transactional upload behavior.
+The project-local `Encryption.py`, `network.py`, and `util.py` modules and the compiled `backend` extension are required. The Linux mount also needs the project's `vfs` module and compatible FUSE packages. The Windows mount needs `winfuse3` and its filesystem dependencies. See `SETUP.md`, `network-README.md`, and `backend-README.md`.
 
-The current entry point supports Windows and Linux; other operating systems raise a runtime error.
+The current entry point supports Windows and Linux; unsupported platforms raise a runtime error.
 
 ## Start the client
 
-Run the client from the directory where you want its identity file and relative application state to live:
-
 ```bash
-python client.py ./auth_key
+python client.py
 ```
 
-The identity path is optional and defaults to `./auth_key`. At startup the client asks whether to authenticate as an administrator and then prompts for the server host/IP. Normal mode also requests a client password. During first-time enrollment, it requests an `Auth Key Security Code` from the bootstrap TOTP configured by an administrator.
+The startup flow asks whether to authenticate as an administrator, then asks for the server host/IP. Normal-client mode requests a client password unless the optional `TPM_client` integration supplies one. On first use, Crypton asks for the server signing public key (the code calls it a server certificate). Verify that key through a trusted channel before pasting its hex representation into the prompt.
 
-If the identity file does not exist, the client attempts bootstrap enrollment. If it already exists, it is treated as the encrypted identity file for normal authentication. Keep the identity file private and back it up securely.
+The mount point is `~/mount` on both supported platforms. Local client identity material is stored relative to the process's current working directory under `./client keys/`.
 
-The mount point in the current source is `~/mount` on both platforms.
+**Current implementation caveat:** `client.py` reads an optional first command-line argument into a variable named `key_path`, but that variable is not passed to `TCPClient` and does not change the identity-file location. The effective identity path remains `./client keys/auth_key`, with `./client keys/salt` and `./client keys/server_cert` alongside it. Do not rely on `python client.py ./auth_key` to select a different identity path until the source is corrected.
 
 ## First-time enrollment
 
-First-time enrollment must be enabled by a server administrator. The administrator signs in using the administrator TOTP, configures and verifies a separate bootstrap TOTP, and enables bootstrap enrollment temporarily. The new client then uses a current bootstrap TOTP code to obtain and save its client identity. The administrator should disable bootstrap enrollment when enrollment is complete.
+A server administrator must configure enrollment before a new client can join:
 
-Do not share the administrator TOTP secret with ordinary clients. For full instructions, see [the setup guide](SETUP.md#4-configure-and-enroll-the-first-client) and [`network-README.md`](network-README.md).
+1. Start `client.py` in administrator mode and enter the current administrator TOTP code.
+2. In the administrator console, generate a separate bootstrap TOTP secret.
+3. Add that Base32 secret to an authenticator app and verify a current code in the console.
+4. Enable bootstrap enrollment for the planned enrollment window.
+5. Start the new normal client, provide the trusted server public key, enter a strong client password, and supply the current `Auth Key Security Code` when prompted.
+6. Disable bootstrap enrollment as soon as authorized clients have enrolled.
 
-## Python API
+The administrator TOTP, bootstrap TOTP, and client password are separate credentials. Never give the administrator TOTP secret to ordinary clients. The client password protects the local client signing key at rest; the server authorizes the enrolled signing key.
 
-The `RemoteStorage` class works without mounting a drive:
+The client and server both use a password-strength check through `zxcvbn`; the current helper rejects estimates at or below 9 log10 guesses. Keep passwords and identity state protected. See `network-README.md` for the authentication flow and file locations.
+
+## Python API: generic remote storage
+
+The generic API can be used without mounting a drive:
 
 ```python
 from client import RemoteStorage
@@ -45,13 +53,11 @@ from client import RemoteStorage
 storage = RemoteStorage(
     host="192.0.2.10",  # Replace with your server's address.
     port=9000,
-    key_path="./auth_key",
-    password=None,      # Prompts interactively.
+    password=None,       # Prompts interactively when omitted or empty.
 )
 
 print(storage.listdir("/"))
 storage.write_file_from_local("./local_document.pdf", "/remote_document.pdf")
-
 with storage.open_read("/remote_document.pdf") as remote_file:
     remote_file.seek(1024)
     sample = remote_file.read(512)
@@ -59,83 +65,62 @@ with storage.open_read("/remote_document.pdf") as remote_file:
 print(storage.get_size("/remote_document.pdf"))
 ```
 
-The constructor is:
+The current constructor is `RemoteStorage(host="127.0.0.1", port=9000, password=None)`. It does **not** accept `key_path` or `auth_key_code_callback` arguments. Bootstrap and server-key prompts are handled by `network.TCPClient`.
 
-```python
-RemoteStorage(
-    host="127.0.0.1",
-    port=9000,
-    key_path="./auth_key",
-    password=None,
-    auth_key_code_callback=None,
-)
-```
-
-`auth_key_code_callback` is a callable used to obtain the bootstrap security code when enrolling a new client. It is not a password callback for an administrator ZIP archive; the current protocol no longer uses that archive flow.
-
-## Common `RemoteStorage` methods
+Common `RemoteStorage` methods:
 
 | Method | Purpose |
 |---|---|
-| `read(path)` | Read a remote file into memory. |
-| `read_chunk(path, offset, length=CHUNK_SIZE)` | Read a portion of a file. |
-| `write_chunk(path, offset, data)` | Write a data chunk at the requested offset. |
-| `write_file_from_local(source, destination)` | Upload a local file in chunks using the standard upload command. |
-| `open_read(path)` | Return a `RemoteReader` with `read`, `seek`, and `tell`. |
-| `listdir(path)` / `list_keys()` | List entries or recursively enumerate remote files. |
-| `exists(path)` / `is_dir(path)` | Query path existence or directory status. |
-| `get_size(path)` / `get_hash(path)` | Retrieve size or server-computed hash information. |
-| `mkdir(path)` / `make_directory(path)` | Create a remote directory. |
-| `delete(path)` | Delete a remote path. This operation affects the server-side file. |
-| `rename(source, destination)` / `move(source, destination)` | Move or rename a remote path. |
-| `copy(source, destination)` | Copy a remote path. |
-| `truncate(path, size)` | Change a remote file's length. |
-| `on(event, callback)` | Register callbacks for `read`, `write`, `delete`, or `mkdir`. |
+| `read(path)` | Reads a complete remote file into memory. |
+| `read_chunk(path, offset, length=CHUNK_SIZE)` | Reads a portion of a file. |
+| `write_chunk(path, offset, data)` | Writes data at a byte offset. |
+| `write_file_from_local(source, destination)` | Uploads a local file through the standard chunked-write command. This is not transactional. |
+| `open_read(path)` | Returns a `RemoteReader` supporting `read`, `seek`, and `tell`. |
+| `listdir(path)` / `list_keys()` | Lists entries or recursively enumerates remote files. |
+| `exists(path)` / `is_dir(path)` / `get_size(path)` | Queries existence, directory status, or size. |
+| `get_hash(path)` | Requests a server-computed hash; may return `None` when the request does not succeed. |
+| `mkdir(path)` / `make_directory(path)` | Creates a remote directory. |
+| `delete(path)` | Deletes a remote path. This changes server-side data. |
+| `rename(source, destination)` / `move(source, destination)` | Moves or renames a remote path. |
+| `copy(source, destination)` | Copies a remote path. |
+| `truncate(path, size)` | Changes a remote file's length. |
+| `on(event, callback)` | Registers `read`, `write`, `delete`, or `mkdir` callbacks. |
 
-Some behaviors differ between the generic API and the Linux mount integration. The Linux `LinuxRemoteStorage` mount adapter uses additional VFS commands for metadata, cache handling, and transactional uploads. Do not assume the generic `write_file_from_local` method has the same transaction semantics as a mounted Linux VFS write.
+The current server's standard `info` response does not include a modification-time field, although generic `RemoteStorage.stat()` reads one if present. As a result, the generic stat method currently falls back to a zero modification time. The Linux VFS path uses separate metadata commands.
 
-The standard `info` response provides the file/directory and modification-time fields used by `RemoteStorage.is_dir()` and `RemoteStorage.stat()`, along with size and chunk information. The Linux VFS-specific metadata commands remain a separate interface with additional filesystem attributes.
+## Linux VFS adapter and transactional upload
 
-## Mount behavior and caching
+On Linux, the mount entry point selects `LinuxRemoteStorage`, which uses `vfs_*` requests for filesystem metadata and writes. The adapter includes a transactional upload workflow:
 
-### Windows
+- It begins an upload with a destination, expected size, and BLAKE3 digest.
+- It sends chunks to a server-side temporary file.
+- The server checks upload completeness and content hash before commit.
+- If an expected version was supplied, commit checks that the destination's version token has not changed.
+- An aborted or idle upload can be cleaned up without replacing the destination file.
 
-The Windows backend uses cfAPI to represent remote files in the local filesystem and hydrate contents when applications access them. Hydration may use local disk space. Deleting a mounted file may delete the remote file instead of only removing a local cached copy; use a supported cache-management procedure to reclaim space.
+`LinuxRemoteStorage.write_file_from_local_if_unchanged(source, destination, expected_version)` exposes an expected-version upload. The version token used by the current server is derived from filesystem metadata, not a full historical content-version database. The generic `RemoteStorage.write_file_from_local()` API does not use this transactional flow.
 
-### Linux
+Detailed cache and journal behavior also depends on the Linux `vfs` mount module, which is a separate component. Keep working-directory state and recovery files intact until pending writes are known to have committed.
 
-The Linux backend uses FUSE and the Crypton VFS. It uses chunk caching and a synchronization journal, and its mount upload workflow supports integrity checks and expected-version conflicts. The cache and journal paths are relative to the current working directory in the current implementation, so consistently launch the client from the intended directory. Preserve recovery files and journals until all writes are known to be committed.
+## Mount behavior
 
-## Event callbacks
+- **Windows:** Uses the `winfuse3` adapter. Accessing a placeholder may hydrate content onto local storage. Deleting a mounted file can delete the remote file; do not treat mounted contents as a disposable cache directory.
+- **Linux:** Uses the `vfs` adapter and FUSE. VFS commands expose filesystem metadata and transactional upload semantics. Cache implementation details should be confirmed in the `vfs` source.
 
-```python
-storage.on("read", lambda path: print("read", path))
-storage.on("write", lambda path, chunk: print("write", path, len(chunk)))
-storage.on("delete", lambda path: print("delete", path))
-storage.on("mkdir", lambda path: print("mkdir", path))
-```
-
-Callbacks are useful for diagnostics and application-level logging. They are not a substitute for server authorization, auditing, or error handling.
+The program attaches diagnostic callbacks to report reads, writes, and deletes. These messages are not a substitute for a server-side audit log or authorization enforcement.
 
 ## Administration and revocation
 
-Run `client.py` and select admin mode to access the administrator console. Administrative functions include listing users/connections, configuring bootstrap TOTP, enabling/disabling bootstrap enrollment, renaming a stored client, deauthorizing a client, and disconnecting a live connection.
+Run `client.py` and choose administrator mode to open the admin console. Current operations include listing registered users and active connections, checking bootstrap status, setting up/verifying bootstrap TOTP, enabling/disabling enrollment, retrieving the server signing public key, renaming a registered client, deauthorizing a client, and disconnecting an active connection.
 
-Deauthorizing a client removes its persistent server-side identity key files. An already-connected session may continue until it is separately disconnected or ends; use the disconnect action when immediate termination is intended.
+Deauthorization removes the persistent server-side client record. It does not by itself guarantee that an already-connected session is terminated; use the disconnect action when immediate termination is required.
 
-## Security notes
+## Security notes and troubleshooting
 
-- Use strong, unique client passwords and protect the client identity file.
-- The server can access plaintext contents of stored files. Encrypt the server's disk/volume if protection at rest is required.
-- Do not expose the service to untrusted networks without reviewing the custom protocol's threat model.
-- Avoid deleting contents of a mount to clear cache; it may be a real remote deletion.
-
-## Troubleshooting
-
-**Cannot connect:** Check the host/IP, TCP port `9000`, server process, firewall, and client identity.
-
-**Bootstrap rejected:** Confirm that bootstrap TOTP was configured and verified by an administrator, bootstrap mode is enabled, the code is current, and the identity path does not already exist.
-
-**Normal login rejected:** Verify the identity file and client password and check whether the administrator deauthorized the client.
-
-**Mount does not start:** Verify the relevant `winfuse3` or `vfs` dependencies and inspect the terminal output. See [`SETUP.md`](SETUP.md).
+- Keep the server signing public key pinned through a trusted channel; do not accept an unexpected key without verification.
+- Protect local `./client keys/` files and use a strong client password.
+- The server can read plaintext files in `~/Shared`. Use encrypted server storage and operating-system access controls for at-rest confidentiality.
+- Do not expose the custom protocol to untrusted networks without an independent threat-model and security review.
+- If connection fails, verify the IP, TCP port `9000`, server status, firewall/routing, server key pin, credentials, and that `backend` imports successfully.
+- If enrollment fails, confirm bootstrap TOTP has been configured and verified, bootstrap is enabled, the code is current, and the server key shown to the client is correct.
+- If the mount does not start, verify the platform's `winfuse3` or `vfs`/FUSE dependencies and review terminal output.

@@ -1,48 +1,50 @@
 # Crypton Networking Module (`network.py`)
 
-`network.py` implements Crypton's custom TCP authentication and message layer. It handles administrator and client authentication, TOTP-based bootstrap enrollment, session-key setup, authenticated message encryption, exchange IDs, and routing callbacks. It delegates socket I/O, framing, connection queues, and worker pools to the native Python extension built from [`backend.cpp`](backend.cpp).
+`network.py` implements the custom TCP authentication and encrypted-message layer used by Crypton. It handles administrator and client authentication, TOTP bootstrap enrollment, key agreement, authenticated payloads, exchange IDs, per-session counters, and application callbacks. The compiled native `backend` extension handles the actual TCP I/O and its transport queues/workers.
 
-**Transport note:** The current source uses the native `backend` TCP extension. It does not use ZeroMQ, despite older documentation that described `pyzmq`. The protocol is custom and should not be treated as TLS or as independently audited merely because it uses standard cryptographic primitives.
+> **Transport and trust warning:** This is a custom protocol, not TLS. The existence of AES-GCM and public-key signatures does not establish that the whole handshake is secure or independently audited. The transport implementation does not use `Encryption.generate_tls()`.
 
 ## Dependencies
-
-Runtime dependencies include:
 
 ```bash
 python -m pip install cryptography argon2-cffi blake3 zxcvbn pyotp
 ```
 
-The local `Encryption.py` and `util.py` modules and the compiled `backend` extension are required. See [`backend-README.md`](backend-README.md) for compiling the extension.
+The local `Encryption.py` and `util.py` modules and a compiled/importable `backend` extension are also required. See `SETUP.md` and `backend-README.md` for the extension build process.
 
-## Authentication and enrollment
+## Authentication and local state
 
-The current implementation uses TOTP codes rather than a ZIP-based administrator bootstrap archive.
+Crypton has separate administrator TOTP, bootstrap TOTP, client password, and server password roles:
 
-- **Server password:** Used to derive the server's at-rest key for protected authorization/TOTP material. A salt is stored in `./server_salt.bin`.
-- **Administrator TOTP:** Allows access to the client-side administrator console. On first server startup, or after an explicit reset, the server prints a Base32 secret. Import it into an authenticator app and keep it private.
-- **Bootstrap TOTP:** A separate TOTP secret that the administrator configures and verifies in the admin console. It must be enabled before a new client can enroll.
-- **Client password:** Protects the client's stored identity material at rest. It is distinct from both TOTP secrets.
-- **Client identity file:** A new client starts with a path that does not yet exist (default `./auth_key`). After successful bootstrap it stores encrypted identity material at that path. A future connection uses that file for normal authentication.
+- **Server password:** Derives the key protecting server-side signing/TOTP material. `network.py` uses `zxcvbn` and rejects password estimates at or below 9 log10 guesses. A 64-byte salt is kept in `./server keys/SERVER SALT`.
+- **Administrator TOTP:** Used for the administrator console. The server creates the secret when needed and prints the Base32 secret at startup; store it in an authenticator and keep it private.
+- **Bootstrap TOTP:** A separate secret configured and verified in the administrator console. New client enrollment is rejected unless bootstrap is enabled.
+- **Client password:** Derives the key protecting a client's local identity key. It is not the administrator TOTP or bootstrap TOTP.
+- **Client identity:** A normal client stores its encrypted signing private key at `./client keys/auth_key` and the associated 64-byte salt at `./client keys/salt`. These paths are relative to the client's current working directory. The server signing key pin is stored at `./client keys/server_cert`.
+- **Server state:** The network layer uses `./server keys/` for the server salt, administrator TOTP, bootstrap TOTP, and signing key, and `./auth keys/` for persistent enrolled-client identity records.
+
+The current code does not accept a client identity-file path as a `TCPClient` argument. The identity location is hard-coded under `./client keys/`; see `client-README.md` for a note about the currently unused command-line path argument.
 
 Recommended enrollment sequence:
 
-1. Log in to admin mode with the administrator TOTP.
-2. Generate and verify the bootstrap TOTP using the admin console.
-3. Enable bootstrap enrollment only for the planned enrollment window.
-4. On the new client, use a new identity path and provide a current bootstrap TOTP code when prompted.
-5. Disable bootstrap enrollment after the authorized client has enrolled.
+1. Start the server and securely record its displayed server signing public key (the code calls this a server certificate).
+2. From `client.py`, enter administrator mode and authenticate with the administrator TOTP.
+3. Configure a separate bootstrap TOTP, add the secret to an authenticator, and verify a current code.
+4. Enable bootstrap enrollment only while authorized clients are being enrolled.
+5. On a new client, provide the trusted server public key when prompted, enter a strong client password, and enter a current bootstrap TOTP code when prompted.
+6. Disable bootstrap enrollment as soon as enrollment is complete.
 
-Do not distribute the administrator TOTP secret to regular clients.
+Do not obtain the server public key from an untrusted connection and blindly accept it. Verify it through a trusted channel before pasting it into the first-use prompt.
 
-## Cryptographic flow (high-level)
+## Cryptographic flow (high level)
 
-The networking implementation calls `Encryption.gen_x25519(True)` for its handshake key pairs; in `Encryption.py`, this selects X448. It derives session material from the key agreement and applies AES-GCM to handshake/application payloads. Message counters and authenticated associated data bind encrypted payloads to their exchange and direction, and the implementation rejects non-increasing counters.
+The code uses X448 for ephemeral key agreement (`Encryption.gen_x25519(True)`), Ed448 signing keys for the server/client identity flow (`Encryption.gen_ed25519(True)`), and AES-GCM for protected handshake and application payloads. Per-message counters and authenticated associated data bind encrypted messages to the exchange ID and direction. Receivers reject invalid or non-increasing counters.
 
-This is a summary of the code, not a security proof. The protocol is custom, the complete handshake should be independently reviewed, and the implementation does not become TLS through use of AES-GCM or through the separate certificate helper in `Encryption.py`.
+This is a description of the implementation, not a security proof. The handshake, certificate/key pinning flow, error handling, and whole deployment model need independent review before the service is exposed to untrusted networks.
 
-## Message exchange
+## Exchange IDs and packet flow
 
-Exchange IDs are exactly 8 bytes. A client can create an exchange and wait for the matching response:
+Exchange IDs (EIDs) are exactly 8 bytes. If no ID is supplied to `send`, the module generates one with `os.urandom(8)`. `send` returns the ID used for that exchange; callers use the same ID for `recv`.
 
 ```python
 from network import TCPClient
@@ -50,25 +52,26 @@ from network import TCPClient
 client = TCPClient(
     host="127.0.0.1",
     port=9000,
-    password="a strong client password",
-    auth_key="./auth_key",
+    password="replace-with-a-strong-client-password",
 )
 try:
     eid = client.send(b"Hello, Crypton")
     response = client.recv(eid, timeout=5.0)
-    if response is not None:
+    if response is None:
+        print("No response before timeout")
+    else:
         print(response)
 finally:
     client.close()
 ```
 
-This example assumes that `./auth_key` is an already-enrolled identity file. For first-time enrollment, pass an `auth_key_code_callback` to provide the current bootstrap TOTP code. Use interactive prompts rather than hard-coded passwords in real applications.
+On first use, a normal `TCPClient` may prompt for a server signing key and bootstrap TOTP. The example assumes the enrollment/trust steps above have been completed. Use interactive prompts or a protected secret store instead of hard-coded credentials in real deployments.
 
-Callbacks receive application payloads after the networking layer has decrypted them. Keep callback code short, handle errors, and avoid assuming that a queued send means the remote application processed the message.
+Application payload framing is the caller's responsibility. `client.py` and `server.py` use a four-byte big-endian metadata length, JSON metadata, and an optional binary payload.
 
 ## `TCPServer` API
 
-The current constructor signature is:
+Current constructor:
 
 ```python
 TCPServer(
@@ -76,31 +79,28 @@ TCPServer(
     port,
     password,
     newTOTP=False,
-    auth_key_dir="./keys",
     on_exchange=None,
-    simult_handshakes=4,
     simult_exchanges=4,
 )
 ```
 
-| Parameter | Meaning |
-|---|---|
-| `host`, `port` | TCP interface address and port. |
-| `password` | Required password used to derive the server at-rest key. |
-| `newTOTP` | When true, generates a new administrator TOTP secret. |
-| `auth_key_dir` | Directory holding server-side client identity key pairs. |
-| `on_exchange` | Optional callback `(server, eid, data, client_id)` for incoming application messages. |
-| `simult_handshakes`, `simult_exchanges` | Worker concurrency settings passed to the native extension. |
+- `host`, `port`: TCP bind address and port.
+- `password`: Required server password used for at-rest key derivation.
+- `newTOTP`: When true, regenerates the administrator TOTP secret.
+- `on_exchange`: Optional callback with signature `(server, eid, data, client_id)`; `data` is decrypted application data.
+- `simult_exchanges`: Worker/concurrency option passed to the native backend.
 
 Useful methods:
 
-- `send(payload, eid=None, client_id=None)` — queue an encrypted message for an authenticated client. `client_id` is required.
-- `recv(client_id, eid, timeout=60)` — wait for a specific exchange on a client connection.
-- `close_client(client_id)` — close the session and clear in-memory state for that client.
-- `set_backpressure(client_id, enabled=True)` — toggle transport backpressure for a client.
-- `close()` — stop the server's native I/O backend.
+| Method | Behavior |
+|---|---|
+| `send(payload, eid=None, client_id=None)` | Sends an encrypted message to an authenticated client. `client_id` is required. If `eid` is omitted, an 8-byte EID is generated. |
+| `recv(client_id, eid, timeout=10)` | Waits for a matching exchange and returns its decrypted payload, or `None` on timeout. The Python layer caps the timeout at 10 seconds. |
+| `close_client(client_id, close=True)` | Closes the backend connection (unless `close=False`) and clears session state. |
+| `set_backpressure(client_id, enabled=True)` | Passes the per-client backpressure toggle to the native backend. |
+| `close()` | Stops the backend and clears in-memory session state. |
 
-The server generates and persists TOTP material in relative files including `ADMIN - TOTP.bin` and, after configuration, `BOOTSTRAP - TOTP.bin`. Preserve these files with the matching `server_salt.bin` and key directory.
+The current constructor does **not** accept `auth_key_dir` or `simult_handshakes`, despite those names appearing in older documentation. Server identity records are addressed by hard-coded paths in `network.py`.
 
 ## `TCPClient` API
 
@@ -111,30 +111,35 @@ TCPClient(
     host,
     port,
     password,
-    auth_key="./auth_key",
     admin_auth_code=None,
-    auth_key_code_callback=None,
     on_exchange=None,
     simult_exchanges=4,
 )
 ```
 
-| Parameter | Meaning |
-|---|---|
-| `host`, `port` | Server hostname/IP and TCP port. |
-| `password` | Client password for at-rest key derivation. |
-| `auth_key` | Existing encrypted client identity file, or a new path for enrollment. |
-| `admin_auth_code` | Current administrator TOTP code when connecting as admin. |
-| `auth_key_code_callback` | Callback that returns the current bootstrap TOTP code during first enrollment. |
-| `on_exchange` | Optional client callback `(client, eid, payload)` for incoming exchanges. |
-| `simult_exchanges` | Worker concurrency setting passed to the native extension. |
+- `host`, `port`: Server hostname/IP and TCP port.
+- `password`: Required positional argument. For normal clients, it protects the local client identity at rest. In administrator mode, `client.py` passes an empty string and supplies `admin_auth_code` instead.
+- `admin_auth_code`: Current administrator TOTP code when opening an administrator session; omit it for normal-client authentication.
+- `on_exchange`: Optional callback with signature `(client, eid, payload)` for decrypted incoming exchanges.
+- `simult_exchanges`: Worker/concurrency option passed to the native backend.
 
-Methods include `send(payload, eid=None)`, `recv(eid, timeout=60)`, `set_backpressure(enabled=True)`, and `close()`. `recv()` returns the decrypted payload or `None`; it may raise for timeout or connection/protocol errors.
+Useful methods:
 
-## Operations and security
+- `send(payload, eid=None)` — sends a message and returns the 8-byte EID.
+- `recv(eid, timeout=10)` — returns a decrypted payload or `None` on timeout. The Python layer caps finite timeouts at 10 seconds.
+- `set_backpressure(enabled=True)` — toggles the client's backpressure setting in the native backend.
+- `close()` — closes the backend client and clears local in-memory session-key/counter state.
 
-- Use random, unique passwords and store secrets in an approved secret manager or protected local storage.
-- Back up the server salt, server key directory, TOTP state files, and client identity files together as needed. Replacing a salt without matching encrypted material may make existing keys unusable.
-- Deauthorizing a client removes its persistent server identity keys. Existing sessions need to be disconnected separately if immediate termination is required.
-- Application payloads are plaintext inside both client and server processes. The server stores file bytes as ordinary files; enable disk encryption and operating-system access controls where at-rest protection is required.
-- Check the full implementation and threat model before exposing the listener to untrusted networks. The protocol is custom and has not been demonstrated here to have undergone an independent security audit.
+Both send/receive methods validate EIDs as 8-byte `bytes` objects. Protocol, decryption, or authentication errors can raise exceptions; callers should handle them and close failed connections.
+
+## Queues, concurrency, and backpressure
+
+`network.py` exposes `simult_exchanges` and `set_backpressure(...)`, but the actual TCP framing, worker pools, send/receive queues, queue limits, overflow policy, and transport backpressure behavior live in the compiled `backend` extension. Those limits cannot be accurately specified from `network.py` alone. Check `backend.cpp` and `backend-README.md` before documenting numeric queue capacities, maximum pending exchanges, drop/reject behavior, or backpressure thresholds. Do not assume queues are unlimited.
+
+## Operational/security notes
+
+- Protect `./server keys/`, `./auth keys/`, and `./client keys/`; preserve salts alongside the encrypted material they protect.
+- Do not change or delete a salt independently of the protected state. The current server initialization can reset key-state directories when stored signing/TOTP material cannot be decrypted.
+- Client deauthorization removes the persistent server-side identity record. It does not necessarily terminate an already-active session; use the explicit disconnect operation for immediate termination.
+- Payloads are plaintext inside client/server processes, and file contents are stored as ordinary files by `server.py`.
+- Use a firewall and an independently reviewed deployment design before exposing the custom protocol to untrusted networks.

@@ -1,124 +1,134 @@
 # Crypton Server (`server.py`)
 
-The Crypton server provides the remote filesystem command handler and writes file data beneath a shared directory. It relies on `network.py` for TOTP-based authentication and encrypted application messages, and on the compiled `backend` extension for TCP I/O.
+`server.py` implements the remote filesystem command handler and writes file data beneath a shared directory. It uses `network.py` for authentication and encrypted application messages and the compiled `backend` extension for TCP I/O.
 
-> **Important:** The server decrypts requests before processing them and stores file content as ordinary files. The current implementation does not encrypt the shared directory at rest, so the server administrator and anyone who can read the server filesystem can access file contents.
+> **Important:** The server decrypts incoming requests before processing them and writes file contents as ordinary files. The current implementation does not encrypt the shared directory at rest. Anyone with sufficient access to the server filesystem can read stored content.
 
 ## Requirements
-
-Install the core Python dependencies and build `backend.cpp` into an importable extension named `backend`:
 
 ```bash
 python -m pip install cryptography argon2-cffi blake3 zxcvbn pyotp pybind11 setuptools
 ```
 
-`Encryption.py`, `network.py`, `server.py`, `util.py`, and the compiled `backend` module must be available. See [`SETUP.md`](SETUP.md) and [`backend-README.md`](backend-README.md).
+The project-local `Encryption.py`, `network.py`, `util.py`, and compiled `backend` extension must be available. See `SETUP.md`, `network-README.md`, and `backend-README.md`.
 
 ## Storage and paths
 
-The default shared directory is configured in `server.py`:
+The shared directory is fixed by the module-level constant in `server.py`:
 
 ```python
 SHARED_DIR = os.path.expanduser("~/Shared")
 ```
 
-The server creates this directory if it is missing. `FileServer` does not currently accept a shared-directory argument; edit `SHARED_DIR` in the source to use another location.
+The server creates it if necessary. `FileServer` does not currently expose a supported shared-directory parameter; edit `SHARED_DIR` in the source if a different directory is required.
 
-By default, the server also uses relative paths in its current working directory:
+The current networking code stores persistent state in paths relative to the server process's working directory:
 
-- `./server_salt.bin` — salt used to derive the server at-rest key.
-- `./keys/` — encrypted server-side client identity key files (`.prv` and `.pub`).
-- `./ADMIN - TOTP.bin` — encrypted administrator TOTP secret.
-- `./BOOTSTRAP - TOTP.bin` — encrypted bootstrap TOTP secret after it has been configured.
+| Path | Purpose |
+|---|---|
+| `./server keys/SERVER SALT` | 64-byte salt used to derive the server at-rest key. |
+| `./server keys/SIGNING KEY` | Server signing private key, encrypted with the derived at-rest key. |
+| `./server keys/ADMIN - TOTP` | Encrypted administrator TOTP secret. |
+| `./server keys/BOOTSTRAP - TOTP` | Encrypted bootstrap TOTP secret after configuration. |
+| `./auth keys/` | Persistent registered-client identity records, signed by the server. |
 
-Run the server from the same working directory on subsequent launches and protect the files above. Do not move or restore the salt separately from the encrypted material it protects. The current key-validation routine expects `.prv`/`.pub` pairs in `./keys` and removes unexpected ordinary files or invalid/incomplete key pairs from that directory at startup; do not store unrelated files there.
+Run the server from a stable, protected working directory so these relative paths resolve consistently. Do not move, replace, or restore a salt independently of the material it protects. The current startup code can remove and recreate the `./auth keys/` and `./server keys/` directories if the signing key or administrator TOTP material cannot be decrypted; a wrong server password or damaged state can therefore cause loss of enrolled-client state. Back up and test restoration before changing credentials or state files.
 
-## Run the server
+Do not put unrelated files in `./auth keys/`. The network layer treats files in that directory as registered-client records.
+
+## Start the server
 
 ```bash
 python server.py
 ```
 
-The command-line entry point attempts to determine a local interface address and defaults to `127.0.0.1` if detection fails. It prompts for the server password, and briefly asks whether to set up a new administrator TOTP. On first startup, the server creates an administrator TOTP if one does not already exist and prints the Base32 secret to the console.
+The command-line entry point tries to determine a local interface address and falls back to `127.0.0.1` if detection fails. It prompts for a server password and first-run administrator TOTP setup when needed. On initial setup, securely copy the displayed Base32 administrator TOTP secret into an authenticator. The server also displays its signing public key; clients use that public key as the server trust anchor.
 
-Add the secret to an authenticator app before the console clears. The client admin console uses the current generated TOTP code to authenticate administrators. Use the printed address and TCP port `9000` when connecting from clients; check firewall/routing rules if remote clients cannot reach it.
+The default port is TCP `9000`. Use an address reachable by intended clients and configure firewall/routing rules accordingly. Binding to `127.0.0.1` allows local-only connections; binding to `0.0.0.0` exposes the listener on all local interfaces and should only be done deliberately.
 
-The programmatic constructor currently exposed by `server.py` is:
-
-```python
-FileServer(host="127.0.0.1", port=9000, password=None, **kwargs)
-```
-
-Example:
+Programmatic constructor:
 
 ```python
 from server import FileServer
 
-server = FileServer(
-    host="0.0.0.0",  # Bind to all interfaces only if this exposure is intended.
+file_server = FileServer(
+    host="127.0.0.1",
     port=9000,
-    password="a strong unique server password",
-    auth_key_dir="./keys",
+    password="replace-with-a-strong-server-password",
 )
 try:
     input("Server running; press Enter to stop.\n")
 finally:
-    server.server.close()
+    file_server.server.close()
 ```
 
-Binding to `0.0.0.0` exposes the listener on all network interfaces. Use a specific interface address and appropriate firewall restrictions for real deployments.
+The `password` argument is required. Do not pass `auth_key_dir` from older examples: `FileServer` forwards extra keyword arguments to `network.TCPServer`, whose current constructor does not accept `auth_key_dir`. The `FileServer.auth_key_dir` attribute is not the storage path used by the current `network.py` implementation.
 
-## Administrator access and client enrollment
-
-The current source uses administrator and bootstrap TOTP credentials, not the older ZIP bootstrap archive documented in historical versions.
+## Administrator access and enrollment
 
 1. Start `client.py` and choose administrator mode.
-2. Enter the server address and current administrator TOTP code.
-3. In the administrator console, create a bootstrap TOTP secret, add it to an authenticator app, and verify a current code.
-4. Enable bootstrap enrollment only while authorized clients are being added.
-5. The new client uses a previously unused identity file path and the current bootstrap TOTP code to enroll.
-6. Disable bootstrap enrollment when done.
+2. Enter the server address and current administrator TOTP code. If prompted, provide the server signing public key through the trusted first-use flow.
+3. In the administrator console, generate a separate bootstrap TOTP secret.
+4. Add the bootstrap secret to an authenticator and verify a current code.
+5. Enable bootstrap enrollment while adding authorized clients.
+6. Have each new client enroll using a current bootstrap TOTP code.
+7. Disable bootstrap enrollment when enrollment is complete.
 
-The bootstrap TOTP is separate from the administrator TOTP and the client password. Do not distribute the administrator secret to ordinary users.
+Keep administrator and bootstrap secrets separate. The administrator console also lists users/connections, retrieves the server public key, renames registered clients, deauthorizes clients, and disconnects active sessions. Deauthorization deletes persistent client identity state but does not necessarily close an already-open session; use disconnect for immediate session termination.
 
-The admin console can list users and connections, rename client identities, deauthorize clients, and disconnect active sessions. Deauthorization deletes persistent identity key files; it does not necessarily close an already-established session. Use the disconnect operation when immediate session termination is required.
+## Filesystem protocol and transfer behavior
 
-## Filesystem protocol
-
-`server.py` accepts JSON metadata with optional binary payloads. The packet helper serializes a four-byte big-endian metadata length, JSON metadata, and then any payload bytes. Filesystem commands include:
+`server.py` expects a packet containing a four-byte big-endian metadata length, UTF-8 JSON metadata, and an optional binary payload. It handles the command families below:
 
 | Command family | Examples |
 |---|---|
-| Basic metadata and transfer | `list`, `info`, `download_chunk`, `upload_chunk`, `get_hash`, `truncate` |
+| Standard metadata and transfer | `list`, `info`, `download_chunk`, `upload_chunk`, `get_hash`, `truncate` |
 | Standard file operations | `mkdir`, `move`, `copy`, `delete` |
 | Linux VFS metadata | `vfs_stat`, `vfs_list`, `vfs_statfs`, `vfs_posix_metadata` |
-| Linux VFS upload | `vfs_begin_upload`, `vfs_upload_chunk`, `vfs_commit_upload`, `vfs_abort_upload` |
-| Administration | `admin_list_connections`, `admin_list_users`, bootstrap TOTP status/setup/enable/disable and client-management commands |
+| Linux VFS mutations/uploads | `vfs_mkdir`, `vfs_delete`, `vfs_move`, `vfs_begin_upload`, `vfs_upload_chunk`, `vfs_commit_upload`, `vfs_abort_upload` |
+| Administration | `admin_list_connections`, `admin_list_users`, bootstrap status/setup/verification/enable/disable, server certificate/key lookup, and client rename/deauthorization/disconnect |
 
-Standard uploads write directly to the destination file at byte offsets; an interrupted transfer can leave a partially updated file. The standard `info` response includes file/directory status and modification time alongside size, chunk size, and chunk count, supporting the generic `RemoteStorage` metadata methods. The Linux VFS upload path uses a temporary file, completeness/size/hash checks, commit/abort operations, and optional expected-version checks to detect conflicting updates.
+### Standard transfers
 
-The standard chunk size is 12 MiB. The server also defines a 16 MiB I/O chunk constant and a 64 MiB maximum for an individual VFS upload chunk. These implementation defaults are not a general throughput guarantee.
+- The standard file chunk size is **12 MiB**.
+- `upload_chunk` writes directly to the target at the requested byte offset. An interrupted standard transfer can leave a partially written file.
+- `info` currently returns path, file/directory status, size, chunk size, and total chunk count. It does not currently return the modification-time field expected by generic `RemoteStorage.stat()`, so that generic API falls back to modification time `0`.
+- `IO_CHUNK_SIZE` is defined as 16 MiB in the source; do not interpret it as a throughput guarantee.
+
+### Linux VFS transactional uploads
+
+The Linux VFS path stages a new file in a temporary file in the destination directory and supports begin/chunk/commit/abort operations. Before replacing the destination, the server checks chunk coverage, expected size, and (when supplied) the BLAKE3 content hash. It can also compare an `expected_version` token to detect a destination change during the upload.
+
+Current VFS upload settings in `server.py` are:
+
+| Setting | Value |
+|---|---:|
+| Upload idle timeout | 3,600 seconds (1 hour) |
+| Maximum individual VFS upload chunk | 32 MiB |
+| Standard file chunk size | 12 MiB |
+
+The 32 MiB maximum is an implementation limit, not a recommended throughput target. An idle incomplete upload can be discarded. A version mismatch returns a conflict rather than replacing the file. The expected-version token is derived from filesystem metadata; it is not a persistent version-history database.
 
 ## Filesystem boundary and security
 
-The `safe_path()` helper resolves requested paths relative to the shared directory and rejects paths whose resolved location falls outside it. This helps protect against straightforward path traversal, but it is not a substitute for operating-system isolation. Symlinks, concurrent path changes, race conditions, and platform-specific filesystem semantics should be considered in a security review.
+The `safe_path()` helper resolves requested paths relative to `~/Shared` and rejects resolved targets outside that directory. This helps prevent straightforward path traversal, but it is not a substitute for OS isolation or a security audit. Symlinks, races, concurrent path changes, and platform-specific filesystem behavior still matter.
 
 Additional deployment protections:
 
-- Store `~/Shared` on an encrypted volume if server-side at-rest confidentiality is needed.
-- Apply restrictive permissions to `~/Shared`, `./keys`, `server_salt.bin`, and TOTP state files.
-- Use strong unique passwords and protect administrator/bootstrap TOTP secrets.
-- Keep the listener behind a firewall and avoid exposing it to untrusted networks without an independent protocol assessment.
-- Back up stored files and Crypton's key/salt/TOTP state securely. Confirm restore procedures before relying on backups.
+- Put `~/Shared` on an encrypted volume if server-side at-rest confidentiality is required.
+- Restrict filesystem permissions for the shared directory and all key/salt/TOTP state.
+- Use strong, unique passwords and protect administrator/bootstrap TOTP secrets.
+- Keep the listener behind a firewall; do not expose this custom protocol to untrusted networks without an independent review.
+- Back up file data and the Crypton key/salt/TOTP state together, and test the restore procedure.
 
 ## Troubleshooting
 
-**Server does not start:** Check Python dependencies, that `backend` imports, that the chosen port is free, and that the current directory permits creation/read access for the salt/key/TOTP files.
+**Server does not start:** Check Python dependencies, confirm `backend` imports, verify the port is free, and confirm the current working directory permits access to `./auth keys/` and `./server keys/`.
 
-**Client cannot reach the server:** Confirm the displayed bind address, port `9000`, firewall, and routing. A loopback bind only permits connections from the same machine.
+**Client cannot connect:** Verify the bind address, TCP port `9000`, firewall/routing, server process, and native `backend` extension.
 
-**Admin login fails:** Confirm the server's administrator TOTP secret is in the authenticator app and device time is correct. Resetting the secret invalidates previously configured authenticator entries.
+**Administrator login fails:** Verify the administrator TOTP secret and device time. A server state reset or regenerated TOTP invalidates the previous authenticator secret.
 
-**Client bootstrap fails:** Bootstrap TOTP must be configured and verified, enrollment must be enabled, the code must be current, and the new identity path must not already exist.
+**Bootstrap enrollment fails:** Confirm bootstrap TOTP is configured and verified, enrollment is enabled, the code is current, and the client has the correct server signing public key.
 
-**A deauthorized client still works:** Persistent deauthorization does not automatically guarantee termination of an already-open session. Disconnect the active connection separately.
+**A deauthorized client remains connected:** Persistent deauthorization does not guarantee termination of an existing session. Disconnect that connection separately.
