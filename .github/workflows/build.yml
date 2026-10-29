@@ -89,11 +89,11 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            echo "artifact-pattern=$(jq -r '.artifacts.windows_pattern' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
+            echo "artifact-pattern=$(jq -r '.artifacts.windows_pattern' build_config.json)" >> "$GITHUB_OUTPUT"
           else
-            echo "artifact-pattern=$(jq -r '.artifacts.linux_pattern' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
+            echo "artifact-pattern=$(jq -r '.artifacts.linux_pattern' build_config.json)" >> "$GITHUB_OUTPUT"
           fi
-          echo "build-dependencies=$(jq -r '.build_dependencies \vert{} join(" ")' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
+          echo "build-dependencies=$(jq -r '.build_dependencies | join(" ")' build_config.json)" >> "$GITHUB_OUTPUT"
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
