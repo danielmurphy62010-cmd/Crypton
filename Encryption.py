@@ -88,8 +88,8 @@ def shared_secret(prv:bytes, pub:bytes) -> bytes:
     return load_keys(prv,algo=(0,4),type=1).exchange(load_keys(pub,algo=(0,4),type=2))
 def get_pub(data):
     d=detect_key_type(data)
-    if d[-1]:return load_keys(data, type=1).public_key().public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw)
-    else:return d[0]
+    if d[-1]:return frame_key(load_keys(data, type=1).public_key().public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw),d[1],False)
+    else:return frame_key(d[0],d[1],False)
 def gen_ed25519(overkill=False) -> tuple[bytes, bytes]:private_key = (ed448.Ed448PrivateKey if overkill else ed25519.Ed25519PrivateKey).generate();return frame_key(private_key.private_bytes(encoding=Encoding.Raw,format=PrivateFormat.Raw,encryption_algorithm=NoEncryption()),'ed448' if overkill else 'ed25519', True), frame_key(private_key.public_key().public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw,),'ed448' if overkill else 'ed25519', False)
 def ed25519_sign(prv:bytes, data:bytes) -> bytes:return load_keys(prv, type=1, algo=(2,6)).sign(data) + data
 def ed25519_verify(pub:bytes, data:bytes) -> bytes:d=detect_key_type(pub,(2,6),False);sig_len = 114 if len(d[0]) == 57 else 64;load_keys(pub, type=2).verify(data[:sig_len], data[sig_len:]);return data[sig_len:]

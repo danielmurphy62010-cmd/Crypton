@@ -1,4 +1,4 @@
-import os, hmac, json, threading, traceback, base64, re, pyotp, backend, Encryption, util, subprocess, time, getpass
+import os, hmac, json, threading, traceback, base64, re, pyotp, backend, Encryption, util, subprocess, time, getpass, shutil
 from zxcvbn import zxcvbn
 try:Encryption.decryptGCM(b'X' * 100, b'X' * 100)
 except Exception as e:DecryptionError = type(e)
@@ -24,31 +24,6 @@ def _derive_at_rest_key(password, salt_or_path):
             salt = os.urandom(SALT_SIZE)
             with open(salt_file, 'wb') as f:f.write(salt)
     return Encryption.kdf_slow(password.encode('utf-8'), salt)
-def validate_auth_keys(at_rest_key):
-    directory='./auth keys'
-    os.makedirs(directory, exist_ok=True)
-    os.makedirs('./server keys', exist_ok=True)
-    for filename in os.listdir(directory):
-        path = os.path.join(directory, filename)
-        if (os.path.isfile(path) and not filename.endswith(('.prv', '.pub'))):os.remove(path)
-    stems = {os.path.splitext(filename)[0] for filename in os.listdir(directory) if filename.endswith(('.prv', '.pub'))}
-    pairs = []
-    for stem in stems:
-        prv = os.path.join(directory, stem + '.prv')
-        pub = os.path.join(directory, stem + '.pub')
-        if os.path.isfile(prv) and os.path.isfile(pub):
-            try:
-                with open(prv, 'rb') as f:p_bytes = Encryption.decryptGCM(f.read(), at_rest_key)
-                with open(pub, 'rb') as f:b_bytes = Encryption.decryptGCM(f.read(), at_rest_key)
-                tmp_key = Encryption.gen_x25519(True)
-                if Encryption.shared_secret(tmp_key[0], b_bytes) == Encryption.shared_secret(p_bytes, tmp_key[1]):
-                    pairs.append((prv, pub))
-                    continue
-            except DecryptionError:raise
-            except Exception:pass
-        for path in (prv, pub):
-            if os.path.exists(path):os.remove(path)
-    return pairs
 class TCPServer:
     def __init__(self, host, port, password, newTOTP=False, on_exchange=None, simult_exchanges=4):
         self.on_exchange = on_exchange
@@ -58,22 +33,31 @@ class TCPServer:
         self._enable_bootstrap = False
         os.makedirs('./auth keys', exist_ok=True)
         os.makedirs('./server keys', exist_ok=True)
-        self.at_rest_key = _derive_at_rest_key(password, './server keys/server_salt.bin')
-        validate_auth_keys(self.at_rest_key)
-        self.bootstrap_totp_path = './server keys/BOOTSTRAP - TOTP.bin'
-        self.admin_totp_path = './server keys/ADMIN - TOTP.bin'
-        self._sig_keys = ['./server keys/SIGNING KEY.pub','./server keys/SIGNING KEY.prv']
-        if any([not os.path.exists(x) for x in self._sig_keys]):
-            try:os.remove(self._sig_keys[0])
-            except:pass
-            try:os.remove(self._sig_keys[1])
+        self.at_rest_key = _derive_at_rest_key(password, './server keys/SERVER SALT')
+        self.bootstrap_totp_path = './server keys/BOOTSTRAP - TOTP'
+        self.admin_totp_path = './server keys/ADMIN - TOTP'
+        self._sig_key = './server keys/SIGNING KEY'
+        RESET=False
+        for x in [self._sig_key,self.admin_totp_path]:
+            try:
+                with open(x,'rb') as f:Encryption.decryptGCM(self.at_rest_key,f.read())
+            except:RESET=True
+        if RESET:
+            shutil.rmtree('./auth keys',True)
+            shutil.rmtree('./server keys',True)
+            os.makedirs('./auth keys', exist_ok=True)
+            os.makedirs('./server keys', exist_ok=True)
+        if any([not os.path.exists(x) for x in [self._sig_key,self.admin_totp_path]]):
+            try:os.remove(self._sig_key)
             except:pass
             keys=Encryption.gen_ed25519(True)
-            with open(self._sig_keys[0],'wb') as f:f.write(Encryption.encryptGCM(keys[0],self.at_rest_key))
-            with open(self._sig_keys[1],'wb') as f:f.write(Encryption.encryptGCM(keys[1],self.at_rest_key))
-        with open(self._sig_keys[0],'rb') as f:prv=Encryption.decryptGCM(f.read(),self.at_rest_key)
-        with open(self._sig_keys[1],'rb') as f:pub=Encryption.decryptGCM(f.read(),self.at_rest_key)
-        self.signing_keys=(prv,pub)
+            with open(self._sig_key,'wb') as f:f.write(Encryption.encryptGCM(keys[0],self.at_rest_key))
+        with open(self._sig_key,'rb') as f:prv=Encryption.decryptGCM(f.read(),self.at_rest_key)
+        self.signing_keys=(prv,Encryption.get_pub(prv))
+        for x in os.listdir('./auth keys'):
+            try:
+                with open(f'./auth keys/{x}','rb') as f:Encryption.ed25519_verify(self.signing_keys[1],f.read())
+            except:pass
         if self.newTOTP or not os.path.exists(self.admin_totp_path):
             totp_secret_bytes = os.urandom(20)
             base32_secret = base64.b32encode(totp_secret_bytes).decode('utf-8')
@@ -84,9 +68,9 @@ class TCPServer:
             def clear_console():
                 try:subprocess.run('cls' if os.name == 'nt' else 'clear',shell=True)
                 except Exception:pass
-                print(f'Server Certificate: {util.to_hex(pub)}')
+                print(f'Server Certificate: {util.to_hex(self.signing_keys[1])}')
             threading.Timer(30.0, clear_console).start()
-        print(f'Server Certificate: {util.to_hex(pub)}')
+        print(f'Server Certificate: {util.to_hex(self.signing_keys[1])}')
         self._lock = threading.RLock()
         self._backend = backend.Server(host, port, handshake_worker=self._hs_worker, on_exchange=self._backend_on_exchange, on_disconnect=self._backend_on_disconnect, simult_handshakes=1, simult_exchanges=simult_exchanges)
         self._keys = {}
@@ -148,7 +132,6 @@ class TCPServer:
             else:
                 auth_file = ''
                 for filename in os.listdir('./auth keys'):
-                    if not filename.endswith('.pub'):continue
                     auth_path = os.path.join('./auth keys', filename)
                     with open(auth_path, 'rb') as f:stored_pub = Encryption.ed25519_verify(self.signing_keys[1],f.read())
                     if hmac.compare_digest(stored_pub, client_pub):
@@ -211,7 +194,7 @@ class TCPServer:
                     if client_ephemeral_pub2 is None:raise ProtocolError('Auth Failed')
                     ekey = Encryption.shared_secret(init_key2[0], client_ephemeral_pub2)
                     fid = os.urandom(16).hex()
-                    with open(os.path.join('./auth keys', fid + '.pub'), 'wb') as f:f.write(Encryption.ed25519_sign(self.signing_keys[0],client_pub))
+                    with open(os.path.join('./auth keys', fid), 'wb') as f:f.write(Encryption.ed25519_sign(self.signing_keys[0],client_pub))
                     _hash = Encryption.basic_kdf(client_pub, b'', 6)
             with self._lock:
                 self._keys[_hash] = ekey
@@ -288,14 +271,7 @@ class TCPServer:
         return username
     def list_users(self,cid,eid):
         self._admin_require(cid)
-        tmp=set()
-        users=set()
-        for x in os.listdir('./auth keys'):
-            name=x[:-4]
-            if x.endswith('.prv') or x.endswith('.pub'):
-                if name in tmp:users.add(name);tmp.discard(name)
-                else:tmp.add(x[:-4])
-        self._admin_send_json({'status':'ok', 'users':sorted(users)},eid,cid)
+        self._admin_send_json({'status':'ok', 'users':os.listdir('./auth keys')},eid,cid)
     def list_connections(self, cid, eid):
         self._admin_require(cid)
         with self._lock:connections = [{'cid':client_id.hex() if isinstance(client_id, bytes) else str(client_id),'username':self._usernames[client_id],} for client_id in self._keys if client_id in self._usernames]
@@ -317,20 +293,13 @@ class TCPServer:
             if connected_id is not None:old_username = self._admin_validate_stored_username(self._usernames[connected_id])
             elif isinstance(target_cid, str):old_username = self._admin_validate_stored_username(target_cid)
             else:raise ProtocolError('Invalid client identifier')
-            old_prv = os.path.join('./auth keys', old_username + '.prv')
-            old_pub = os.path.join('./auth keys', old_username + '.pub')
-            new_prv = os.path.join('./auth keys', new_username + '.prv')
-            new_pub = os.path.join('./auth keys', new_username + '.pub')
+            old = os.path.join('./auth keys', old_username)
+            new = os.path.join('./auth keys', new_username)
             if old_username == new_username:result = {'ok':True,'username':new_username,'connected':connected_id is not None,'renamed_files':False,}
             else:
-                if not os.path.isfile(old_prv) or not os.path.isfile(old_pub):raise ProtocolError('Client key files not found')
-                if os.path.exists(new_prv) or os.path.exists(new_pub):raise ProtocolError('Username already exists')
-                try:
-                    os.rename(old_prv, new_prv)
-                    try:os.rename(old_pub, new_pub)
-                    except Exception:
-                        os.rename(new_prv, old_prv)
-                        raise
+                if not os.path.isfile(old):raise ProtocolError('Client key files not found')
+                if os.path.exists(new):raise ProtocolError('Username already exists')
+                try:os.rename(old, new)
                 except Exception as exc:raise ProtocolError(f'Rename failed:{exc}') from exc
                 for live_id, stored_username in list(self._usernames.items()):
                     if live_id not in self._keys:continue
@@ -346,11 +315,9 @@ class TCPServer:
         with self._lock:
             if target_cid not in self._usernames:raise ProtocolError('Unknown client')
             username = self._admin_validate_stored_username(self._usernames[target_cid])
-            prv = os.path.join('./auth keys', username + '.prv')
-            pub = os.path.join('./auth keys', username + '.pub')
-            if not os.path.isfile(prv) or not os.path.isfile(pub):raise ProtocolError('Client key files not found')
+            prv = os.path.join('./auth keys', username)
+            if not os.path.isfile(prv):raise ProtocolError('Client key files not found')
             os.remove(prv)
-            os.remove(pub)
         self._admin_send_json({'status':'ok', 'deauthenticated':True, 'username':username},eid,cid)
     def disconnect_client(self, cid, eid, target_cid):
         self._admin_require(cid)
@@ -432,10 +399,14 @@ class TCPClient:
             os.makedirs('./client keys',exist_ok=True)
             self.salt=os.urandom(SALT_SIZE)
             try:
-                with open('./client keys/auth_key', 'rb') as f:
-                    self.salt = f.read(SALT_SIZE)
-                    encrypted_prv = f.read()
-                if len(self.salt) != SALT_SIZE:raise ProtocolError('Invalid auth_key: missing salt')
+                with open('./client keys/salt', 'rb') as f:self.salt = f.read()
+                if len(self.salt) != SALT_SIZE:
+                    self.salt=os.urandom(SALT_SIZE)
+                    os.remove('./client keys/salt')
+                    os.remove('./client keys/auth_key')
+            except:pass
+            try:
+                with open('./client keys/auth_key', 'rb') as f:encrypted_prv = f.read()
                 if not encrypted_prv:raise ProtocolError('Invalid auth_key: missing key data')
             except:pass
             try:
@@ -444,8 +415,8 @@ class TCPClient:
                 self.sig_prv = Encryption.decryptGCM(encrypted_prv, self.at_rest_key)
                 self.pub_key = Encryption.get_pub(self.sig_prv)
                 try:
-                    if os.path.exists('./client keys/Server cert.pub'):
-                        with open('./client keys/Server cert.pub','rb') as f:self.server_cert=Encryption.ed25519_verify(self.pub_key,f.read())
+                    if os.path.exists('./client keys/server_cert'):
+                        with open('./client keys/server_cert','rb') as f:self.server_cert=Encryption.ed25519_verify(self.pub_key,f.read())
                 except:pass
             except:pass
         if self.server_cert==b'':self.server_cert=util.from_hex(input('The server cannot be verified as there isn\'t a saved certificate.\nPlease paste the certificate here: '))
@@ -499,10 +470,9 @@ class TCPClient:
             self._send_handshake(self.pub_key)
             server_cert = self._recv_handshake(timeout=1)
             if self.server_cert != server_cert:raise ProtocolError('Server certificate is invalid')
-            with open('./client keys/Server cert.pub', 'wb') as f:f.write(server_cert)
+            with open('./client keys/server_cert', 'wb') as f:f.write(Encryption.ed25519_sign(self.sig_prv,server_cert))
             status = self._recv_handshake(timeout=5)
             if status == b'ACK':
-                with open('./client keys/Server cert.pub', 'wb') as f:f.write(server_cert)
                 response = Encryption.ed25519_verify(server_cert, self._recv_handshake(timeout=5))
                 if response is None:raise ProtocolError('Handshake timed out')
                 server_ephemeral_pub = response
@@ -511,7 +481,6 @@ class TCPClient:
                 self.ekey = Encryption.shared_secret(keys[0], server_ephemeral_pub)
                 self.sc, self.rc = 1, 0
             elif status == b'NACK':
-                with open('./client keys/Server cert.pub', 'wb') as f:f.write(server_cert)
                 response = Encryption.ed25519_verify(server_cert, self._recv_handshake(timeout=5))
                 if response is None:raise ProtocolError('Handshake timed out')
                 server_ephemeral_pub = response[:-64]
@@ -549,9 +518,7 @@ class TCPClient:
                 self._send_handshake(Encryption.ed25519_sign(self.sig_prv, keys2[1]))
                 self.ekey = Encryption.shared_secret(keys2[0], server_ephemeral_pub2)
                 self.sc, self.rc = sc, rc
-                with open('./client keys/auth_key', 'wb') as f:
-                    f.write(self.salt)
-                    f.write(Encryption.encryptGCM(self.sig_prv, self.at_rest_key))
+                with open('./client keys/auth_key', 'wb') as f:f.write(Encryption.encryptGCM(self.sig_prv, self.at_rest_key))
             else:raise ProtocolError('Auth Denied')
         self._backend.auth_finished()
     def send(self, payload, eid=None):
