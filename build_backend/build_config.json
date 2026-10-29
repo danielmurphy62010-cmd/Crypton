@@ -1,7 +1,7 @@
 {
   "module_name": "backend",
   "sources": ["backend.cpp"],
-  "build_dependencies": ["setuptools>=68", "wheel>=0.43", "pybind11>=2.13.6"],
+  "build_dependencies": ["setuptools", "wheel", "pybind11"],
   "cxx_standard": 17,
   "windows_libraries": ["ws2_32", "bcrypt"],
   "unix_libraries": [],
