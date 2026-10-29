@@ -47,7 +47,7 @@ class RemoteReader:
     def close(self):pass
 class RemoteStorage:
     def __init__(self, host="127.0.0.1", port=9000, password=None):
-        if not password:password = getpass.getpass("Client password:")
+        if not password:password = getpass.getpass("Client password: ")
         import network
         try:self.client = network.TCPClient(host=host,port=port,password=password)
         except Exception as e:traceback.print_exception(e);raise OSError
@@ -363,12 +363,12 @@ def admin_console(client):
                     username = selected.get("username", "?")
                     if choice == "4":
                         print("This revokes future authentication; it does not disconnect the active session.")
-                        if ask(f"Revoke {username}'s key? Type YES to confirm: ") == "YES":
+                        if not ask(f"Revoke {username}'s key? [y/N]: ").strip().lower().startswith('y'):
                             admin_request(client,"admin_deauth_client",target_cid=target)
                             print("Authentication key revoked.")
                         else:print("Revocation cancelled.")
                     else:
-                        if ask(f"Disconnect {username}? Type YES to confirm: ") == "YES":
+                        if not ask(f"Disconnect {username}? [y/N]: ").strip().lower().startswith('y'):
                             admin_request(client,"admin_disconnect_client",target_cid=target)
                             print("Disconnect requested.")
                             print("\nUpdated client list:")
@@ -376,7 +376,7 @@ def admin_console(client):
                         else:print("Disconnect cancelled.")
             elif choice == "6":
                 result = admin_request(client, "admin_bootstrap_status")
-                print("Bootstrapping:", "ENABLED" if result.get("enabled") else "disabled")
+                print("Bootstrapping:", "ENABLED" if result.get("enabled") else "DISABLED")
                 print("Bootstrap TOTP:", "configured" if result.get("totp_configured") else "not configured")
             elif choice == "7":
                 result = admin_request(client, "admin_enable_bootstrap")
@@ -385,7 +385,7 @@ def admin_console(client):
                 admin_request(client, "admin_disable_bootstrap")
                 print("Bootstrapping disabled.")
             elif choice == "9":
-                if ask("Generate a new bootstrap TOTP secret? Type YES to confirm: ") != "YES":print("TOTP setup cancelled.")
+                if not ask("Generate a new bootstrap TOTP secret? [y/N]: ").strip().lower().startswith('y'):print("TOTP setup cancelled.")
                 else:
                     result = admin_request(client, "admin_setup_bootstrap_totp")
                     secret = result.get("secret")
@@ -408,9 +408,7 @@ def admin_console(client):
                             except Exception as exc:
                                 print(f"Verification failed: {exc}")
                                 if "No pending" in str(exc):break
-            elif choice == "0":
-                data=util.from_hex(admin_request(client, "admin_server_cert").get('cert'))
-                print(f'Server certificate: {util.to_hex(Encryption.decryptGCM(data[:-64],Encryption.kdf_slow(util.str_to_bytes(getpass.getpass('Server Password: ')),data[-64:])))}')
+            elif choice == "0":print(f'Server certificate: {admin_request(client, "admin_server_cert").get('cert')}')
             else:print("Please choose an option from 1 to A.")
         except (KeyboardInterrupt, EOFError):
             print()
@@ -434,7 +432,7 @@ if __name__ == "__main__":
     if TPM:
         try:ip = c.get_bytes("SFTP client host IP")["value"].decode("ascii")
         except:ip = ""
-    ip = input(f"Host IP [{ip}]:").strip() or ip
+    ip = input(f"Host IP [{ip}]: ").strip() or ip
     if not ip:raise RuntimeError("Host IP required")
     if admin_mode:
         password = ""
@@ -449,9 +447,9 @@ if __name__ == "__main__":
     while retry and retrys>0:
         retrys-=1
         retry=False
-        if password==None:password = getpass.getpass("Client password:")
+        if password==None:password = getpass.getpass("Client password: ")
         storage_class = RemoteStorage if PLATFORM == "windows" else LinuxRemoteStorage
-        storage = storage_class(host=ip,key_path=key_path,password=password)
+        storage = storage_class(host=ip,password=password)
     if retrys==0 and retry:raise RuntimeError('Setup Error')
     if TPM:
         try:c.create_bytes('SFTP client password',password.encode('ascii'))
