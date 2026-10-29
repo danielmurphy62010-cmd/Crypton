@@ -1,13 +1,10 @@
 name: Build Backend
-
 on:
   push:
   pull_request:
   workflow_dispatch:
-
 permissions:
-  contents: read
-
+  contents: write
 jobs:
   discover:
     name: Discover available stable CPython builds
@@ -22,7 +19,6 @@ jobs:
             --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 120 \
             https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json \
             --output "$RUNNER_TEMP/versions-manifest.json"
-
       - name: Generate the OS/Python matrix
         id: generate
         shell: bash
@@ -32,25 +28,19 @@ jobs:
           import os
           import re
           import sys
-
           with open(sys.argv[1], "r", encoding="utf-8") as stream:
               manifest = json.load(stream)
-
           version_pattern = re.compile(r"(\d+)\.(\d+)\.(\d+)$")
           available = set()
-
           for release in manifest:
               if release.get("stable") is not True:
                   continue
-
               match = version_pattern.fullmatch(str(release.get("version", "")))
               if not match:
                   continue
-
               major, minor, _patch = map(int, match.groups())
               if (major, minor) < (3, 12):
                   continue
-
               for item in release.get("files", []):
                   platform = item.get("platform")
                   arch = item.get("arch")
@@ -59,14 +49,12 @@ jobs:
                       "x64-freethreaded",
                   ):
                       available.add((major, minor, platform, arch))
-
           runners = (
               ("ubuntu-latest", "linux"),
               ("windows-latest", "win32"),
           )
           versions = sorted({(major, minor) for major, minor, _, _ in available})
           include = []
-
           for runner, platform in runners:
               for major, minor in versions:
                   version = f"{major}.{minor}"
@@ -74,34 +62,28 @@ jobs:
                       include.append({"os": runner, "python": version})
                   if (major, minor, platform, "x64-freethreaded") in available:
                       include.append({"os": runner, "python": version + "t"})
-
           if not include:
               raise SystemExit(
                   "No stable CPython >= 3.12 builds found in setup-python's manifest"
               )
-
           matrix = {"include": include}
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
-
           print(f"Discovered {len(include)} build combinations:")
           for row in include:
               print(f"  {row['os']} / Python {row['python']}")
           PY
-
   build:
-    name: Build on ${{ matrix.os }} / Python ${{ matrix.python }}
+    name: Build on ${{ matrix.os }} / Python${{ matrix.python }}
     needs: discover
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       max-parallel: 14
       matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
-
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
       - name: Read build configuration
         id: config
         shell: bash
@@ -111,30 +93,23 @@ jobs:
           else
             echo "artifact-pattern=$(jq -r '.artifacts.linux_pattern' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
           fi
-          echo "build-dependencies=$(jq -r '.build_dependencies | join(" ")' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
-
+          echo "build-dependencies=$(jq -r '.build_dependencies \vert{} join(" ")' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
-
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
-
       - name: Install build dependencies
         shell: bash
         run: python -m pip install --upgrade ${{ steps.config.outputs.build-dependencies }}
-
       # Override an older pybind11 pin so newer Python releases can use current support.
       - name: Ensure recent pybind11
         run: python -m pip install --upgrade "pybind11>=3.1.0"
-
       - name: Build native extension
         run: python build_backend/setup.py build_ext --inplace --force
-
       - name: Smoke-test extension import
         run: python -c "import backend; print('Imported:', backend.__doc__)"
-
       # One temporary artifact per matrix job; the package job merges them.
       - name: Upload temporary build result
         uses: actions/upload-artifact@v4
@@ -143,106 +118,53 @@ jobs:
           path: ${{ steps.config.outputs.artifact-pattern }}
           if-no-files-found: error
           retention-days: 1
-
   package:
     name: Package all compiled binaries
     needs: build
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: write
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
       - name: Download all build results
         uses: actions/download-artifact@v4
         with:
           pattern: networking-v2-build-*
           path: dist
           merge-multiple: false
-
       - name: Collect extensions into one flat directory
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p package-root
-
           # Flatten all compiled extensions from every build job.
           while IFS= read -r -d '' file; do
             name="${file##*/}"
             destination="package-root/$name"
-
             if [[ -e "$destination" ]]; then
               echo "Duplicate filename detected: $name" >&2
               echo "Source: $file" >&2
               exit 1
             fi
-
             cp -- "$file" "$destination"
           done < <(
-            find dist -type f \( -name '*.so' -o -name '*.pyd' \) -print0
+            find dist -type f \(-name '*.so' -o -name '*.pyd'\) -print0
           )
-
           if ! find package-root -maxdepth 1 -type f -print -quit | grep -q .; then
             echo "No .so or .pyd files found." >&2
             exit 1
           fi
-
           echo "Files that will appear at the ZIP root:"
           find package-root -maxdepth 1 -type f -printf '%f\n' | sort
-
-      # GitHub Actions packages uploaded artifact files into one downloadable ZIP.
-      # Upload the binaries directly; do not create a ZIP here, or the download
-      # will contain a ZIP inside GitHub's artifact ZIP.
-      - name: Upload single downloadable artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-compiled
-          path: package-root/*
-          if-no-files-found: error
-          retention-days: 30
-
-  cleanup-intermediate-artifacts:
-    name: Remove temporary per-version artifacts
-    if: ${{ always() }}
-    needs:
-      - build
-      - package
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Delete temporary build artifacts
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const run_id = context.runId;
-            const prefix = "networking-v2-build-";
-            const allArtifacts = [];
-
-            // Collect all pages before deleting so pagination cannot skip entries.
-            for (let page = 1; ; page++) {
-              const response = await github.rest.actions.listWorkflowRunArtifacts({
-                owner,
-                repo,
-                run_id,
-                per_page: 100,
-                page,
-              });
-              allArtifacts.push(...response.data.artifacts);
-              if (response.data.artifacts.length < 100) break;
-            }
-
-            const temporary = allArtifacts.filter((artifact) =>
-              artifact.name.startsWith(prefix)
-            );
-
-            for (const artifact of temporary) {
-              core.info(`Deleting temporary artifact: ${artifact.name}`);
-              await github.rest.actions.deleteArtifact({
-                owner,
-                repo,
-                artifact_id: artifact.id,
-              });
-            }
-
-            core.info(`Deleted ${temporary.length} temporary artifact(s).`);
+      - name: Create ZIP archive
+        shell: bash
+        run: |
+          cd package-root
+          zip -r ../backend-binaries.zip .
+          cd ..
+      - name: Commit and push ZIP to repo root
+        shell: bash
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.nore
