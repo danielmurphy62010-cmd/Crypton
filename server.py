@@ -229,6 +229,9 @@ class FileServer:
                 elif cmd == "admin_disconnect_client":
                     server_inst.disconnect_client(cid, eid, meta.get("target_cid", ""))
                     return
+                elif cmd == "admin_server_cert":
+                    server_inst.server_cert(cid, eid)
+                    return
                 else:
                     result = {"status": "error","message": f"Unknown admin command: {cmd}"}
                     server_inst.send(make_packet(result), eid=eid, client_id=cid)

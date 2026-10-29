@@ -1,4 +1,4 @@
-import json, os, sys, getpass, traceback, time, errno, blake3
+import json, os, sys, getpass, traceback, time, errno, blake3, Encryption, util
 CHUNK_SIZE = 12 * 1024 * 1024
 if sys.platform == "win32":
     import winfuse3 as mount_backend
@@ -46,10 +46,10 @@ class RemoteReader:
     def tell(self):return self.offset
     def close(self):pass
 class RemoteStorage:
-    def __init__(self, host="127.0.0.1", port=9000, key_path="./auth_key", password=None, auth_key_code_callback=None):
+    def __init__(self, host="127.0.0.1", port=9000, password=None):
         if not password:password = getpass.getpass("Client password:")
         import network
-        try:self.client = network.TCPClient(host=host,port=port,password=password,auth_key=key_path,auth_key_code_callback=auth_key_code_callback)
+        try:self.client = network.TCPClient(host=host,port=port,password=password)
         except Exception as e:traceback.print_exception(e);raise OSError
         self.lock = __import__("threading").Lock()
         self.callbacks = {"read":None, "write":None, "delete":None, "mkdir":None}
@@ -333,9 +333,10 @@ def admin_console(client):
         print(" 7. Enable bootstrapping")
         print(" 8. Disable bootstrapping")
         print(" 9. Set up / reset bootstrap TOTP")
-        print(" 0. Exit admin console")
-        choice = ask("\nChoose an option [1-10]: ")
-        if choice in ("0","10"):return
+        print(" 0. Show server cert")
+        print(" A. Exit admin console")
+        choice = ask("\nChoose an option [1-A]: ").lower()
+        if choice=="a":return
         try:
             if choice == "1":show_connections()
             elif choice == "2":show_users()
@@ -407,13 +408,15 @@ def admin_console(client):
                             except Exception as exc:
                                 print(f"Verification failed: {exc}")
                                 if "No pending" in str(exc):break
-            else:print("Please choose a number from 1 to 9.")
+            elif choice == "0":
+                data=util.from_hex(admin_request(client, "admin_server_cert").get('cert'))
+                print(f'Server certificate: {util.to_hex(Encryption.decryptGCM(data[:-64],Encryption.kdf_slow(util.str_to_bytes(getpass.getpass('Server Password: ')),data[-64:])))}')
+            else:print("Please choose an option from 1 to A.")
         except (KeyboardInterrupt, EOFError):
             print()
             return
         except Exception as exc:print(f"Admin command failed: {exc}")
         pause_and_clear()
-def auth_key_code_callback():return input('Auth Key Security Code: ')
 if __name__ == "__main__":
     key_path = sys.argv[1] if len(sys.argv) > 1 else "./auth_key"
     admin_mode = input("Authenticate as admin? [y/N]: ").strip().lower().startswith("y")
@@ -437,7 +440,7 @@ if __name__ == "__main__":
         password = ""
         admin_code = getpass.getpass("Admin TOTP code: ").strip()
         import network
-        admin_client = network.TCPClient(host=ip, port=9000, password="",auth_key=key_path, admin_auth_code=admin_code)
+        admin_client = network.TCPClient(host=ip, port=9000, password="", admin_auth_code=admin_code)
         try:admin_console(admin_client)
         finally:admin_client.close()
         raise SystemExit(0)
@@ -448,7 +451,7 @@ if __name__ == "__main__":
         retry=False
         if password==None:password = getpass.getpass("Client password:")
         storage_class = RemoteStorage if PLATFORM == "windows" else LinuxRemoteStorage
-        storage = storage_class(host=ip,key_path=key_path,password=password,auth_key_code_callback=auth_key_code_callback)
+        storage = storage_class(host=ip,key_path=key_path,password=password)
     if retrys==0 and retry:raise RuntimeError('Setup Error')
     if TPM:
         try:c.create_bytes('SFTP client password',password.encode('ascii'))
