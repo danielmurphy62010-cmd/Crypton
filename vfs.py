@@ -5,7 +5,7 @@ from typing import BinaryIO, Optional
 if os.name != "posix":raise RuntimeError("This program requires a POSIX operating system.")
 try:from fuse import FUSE, Operations, FuseOSError
 except ImportError as exc:raise RuntimeError("The 'fusepy' package and the system FUSE library are required. Install fusepy and your distribution's FUSE package first.") from exc
-CHUNK_SIZE = 16 * 1024 * 1024
+CHUNK_SIZE = 64 * 1024 * 1024
 CACHE_TTL = 60 * 2
 CACHE_SWEEP_INTERVAL = 1
 CACHE_DIR = "./cache"

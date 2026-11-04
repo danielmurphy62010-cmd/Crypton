@@ -48,7 +48,7 @@ struct WinFuseTransferDataParameters {
     LARGE_INTEGER Length;
 };
 namespace {
-constexpr std::size_t FETCH_CHUNK_SIZE = 16u * 1024u * 1024u;
+constexpr std::size_t FETCH_CHUNK_SIZE = 64u * 1024u * 1024u;
 constexpr DWORD PAGE_SIZE = 4096;
 constexpr std::int64_t CF_EOF_VALUE = -1;
 constexpr DWORD CF_UPDATE_FLAG_MARK_IN_SYNC_VALUE = 0x02;
