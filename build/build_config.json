@@ -1,0 +1,69 @@
+{
+  "backend": {
+    "sources": [
+      "backend.cpp"
+    ],
+    "build_dependencies": [
+      "setuptools",
+      "wheel",
+      "pybind11"
+    ],
+    "cxx_standard": 17,
+    "windows_libraries": [
+      "ws2_32",
+      "bcrypt"
+    ],
+    "unix_libraries": [],
+    "compiler_args": {
+      "msvc": [
+        "/W4",
+        "/EHsc"
+      ],
+      "unix": [
+        "-Wall",
+        "-Wextra",
+        "-Wpedantic"
+      ]
+    },
+    "artifacts": {
+      "windows_pattern": "backend*.pyd",
+      "linux_pattern": "backend*.so",
+      "name": "backend-compiled",
+      "commit_to_repo": true
+    }
+  },
+  "winfuse4": {
+    "sources": [
+      "winfuse4.cpp"
+    ],
+    "build_dependencies": [
+      "setuptools",
+      "wheel",
+      "pybind11"
+    ],
+    "cxx_standard": 17,
+    "windows_libraries": [
+      "cldapi",
+      "bcrypt",
+      "ole32"
+    ],
+    "unix_libraries": [],
+    "compiler_args": {
+      "msvc": [
+        "/W4",
+        "/EHsc"
+      ],
+      "unix": [
+        "-Wall",
+        "-Wextra",
+        "-Wpedantic"
+      ]
+    },
+    "artifacts": {
+      "windows_pattern": "winfuse4*.pyd",
+      "linux_pattern": "winfuse4*.so",
+      "name": "winfuse4-compiled",
+      "commit_to_repo": false
+    }
+  }
+}

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   discover:
@@ -102,17 +102,6 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Read build configuration
-        id: config
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            echo "artifact-pattern=$(jq -r '.artifacts.windows_pattern' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
-          else
-            echo "artifact-pattern=$(jq -r '.artifacts.linux_pattern' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
-          fi
-          echo "build-dependencies=$(jq -r '.build_dependencies | join(" ")' build_backend/build_config.json)" >> "$GITHUB_OUTPUT"
-
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -121,37 +110,173 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: Install build dependencies
+      - name: Install dependencies for all configured modules
         shell: bash
         run: |
-          DEPS="${{ steps.config.outputs.build-dependencies }}"
-          if [ -n "$DEPS" ]; then
-            python -m pip install --upgrade $DEPS
-          else
-            echo "No build dependencies specified."
-          fi
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+          from pathlib import Path
 
-      # Override an older pybind11 pin so newer Python releases can use current support.
+          config = json.loads(Path("build/build_config.json").read_text(encoding="utf-8"))
+          if not isinstance(config, dict) or not config:
+              raise SystemExit("build_config.json must be a non-empty object keyed by module name")
+
+          dependencies = []
+          for module_name, module_config in config.items():
+              if not isinstance(module_config, dict):
+                  raise SystemExit(f"Configuration for {module_name!r} must be an object")
+              module_dependencies = module_config.get("build_dependencies", [])
+              if not isinstance(module_dependencies, list) or any(
+                  not isinstance(item, str) for item in module_dependencies
+              ):
+                  raise SystemExit(f"{module_name}.build_dependencies must be an array of strings")
+              dependencies.extend(module_dependencies)
+
+          # Install the union once for this OS/Python matrix job.
+          dependencies = list(dict.fromkeys(dependencies))
+          if dependencies:
+              subprocess.run(
+                  [sys.executable, "-m", "pip", "install", "--upgrade", *dependencies],
+                  check=True,
+              )
+          else:
+              print("No build dependencies specified.")
+          PY
+
+      # Keep pybind11 recent so current CPython releases, including free-threaded builds, are supported.
       - name: Ensure recent pybind11
         run: python -m pip install --upgrade "pybind11>=3.1.0"
 
-      - name: Build native extension
-        run: python build_backend/setup.py build_ext --inplace --force
+      - name: Build every configured module
+        shell: bash
+        run: |
+          python - <<'PY'
+          import fnmatch
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
 
-      - name: Smoke-test extension import
-        run: python -c "import backend; print('Imported:', backend.__doc__)"
+          config = json.loads(Path("build/build_config.json").read_text(encoding="utf-8"))
+          if not isinstance(config, dict) or not config:
+              raise SystemExit("build_config.json must be a non-empty object keyed by module name")
 
-      # One temporary artifact per matrix job; the package job merges them.
-      - name: Upload temporary build result
+          module_names = list(config)
+          safe_name = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*$")
+          if any(
+              not isinstance(name, str)
+              or name in (".", "..", "_temp")
+              or not safe_name.fullmatch(name)
+              for name in module_names
+          ):
+              raise SystemExit(
+                  "Top-level module keys must be safe names containing only letters, digits, _, ., and -"
+              )
+          if len({name.casefold() for name in module_names}) != len(module_names):
+              raise SystemExit("Top-level module keys must be unique, ignoring case")
+
+          runner_os = os.environ["RUNNER_OS"]
+          pattern_key = "windows_pattern" if runner_os == "Windows" else "linux_pattern"
+          runner_temp = Path(os.environ["RUNNER_TEMP"])
+          build_root = runner_temp / "native-builds"
+          temp_root = runner_temp / "native-build-temp"
+          for directory in (build_root, temp_root):
+              if directory.exists():
+                  shutil.rmtree(directory)
+              directory.mkdir(parents=True)
+
+          for module_key, module_config in config.items():
+              if not isinstance(module_config, dict):
+                  raise SystemExit(f"Configuration for {module_key!r} must be an object")
+
+              artifacts = module_config.get("artifacts")
+              if not isinstance(artifacts, dict):
+                  raise SystemExit(f"{module_key}.artifacts must be an object")
+              pattern = artifacts.get(pattern_key)
+              if not isinstance(pattern, str) or not pattern:
+                  raise SystemExit(f"{module_key}.artifacts.{pattern_key} must be a non-empty string")
+
+              module_output = build_root / module_key
+              module_temp = temp_root / module_key
+              module_output.mkdir(parents=True)
+              module_temp.mkdir(parents=True)
+
+              command = [
+                  sys.executable,
+                  "build/setup.py",
+                  "--module", module_key,
+                  "build_ext",
+                  "--build-lib", str(module_temp / "raw-lib"),
+                  "--build-temp", str(module_temp / "objects"),
+                  "--force",
+              ]
+              print(f"\n=== Building module: {module_key} ===", flush=True)
+              subprocess.run(command, check=True)
+
+              raw_output = module_temp / "raw-lib"
+              matches = [
+                  path for path in raw_output.rglob("*")
+                  if path.is_file() and fnmatch.fnmatch(path.name, pattern)
+              ]
+              if not matches:
+                  raise SystemExit(
+                      f"Module {module_key!r} produced no files matching {pattern!r}"
+                  )
+
+              flattened = set()
+              for extension in matches:
+                  filename_key = extension.name.casefold()
+                  if filename_key in flattened:
+                      raise SystemExit(
+                          f"Module {module_key!r} produced duplicate filename {extension.name!r}"
+                      )
+                  flattened.add(filename_key)
+                  destination = module_output / extension.name
+                  shutil.copy2(extension, destination)
+                  print(f"Built: {destination}")
+
+              module_name = module_config.get("module_name", module_key)
+              if not isinstance(module_name, str) or not module_name:
+                  raise SystemExit(f"{module_key}.module_name must be a non-empty string")
+              smoke_test = module_config.get("smoke_test", True)
+              if not isinstance(smoke_test, bool):
+                  raise SystemExit(f"{module_key}.smoke_test must be true or false")
+              if smoke_test:
+                  env = os.environ.copy()
+                  previous = env.get("PYTHONPATH", "")
+                  env["PYTHONPATH"] = str(raw_output) + (
+                      os.pathsep + previous if previous else ""
+                  )
+                  subprocess.run(
+                      [
+                          sys.executable,
+                          "-c",
+                          "import importlib, sys; module = importlib.import_module(sys.argv[1]); "
+                          "print('Imported:', module.__name__, getattr(module, '__doc__', None))",
+                          module_name,
+                      ],
+                      cwd=raw_output,
+                      env=env,
+                      check=True,
+                  )
+          PY
+
+      # One temporary artifact per matrix job; all configured modules are inside it.
+      - name: Upload temporary build results
         uses: actions/upload-artifact@v4
         with:
           name: networking-v2-build-${{ matrix.os }}-py${{ matrix.python }}
-          path: ${{ steps.config.outputs.artifact-pattern }}
+          path: ${{ runner.temp }}/native-builds
           if-no-files-found: error
           retention-days: 1
 
   package:
-    name: Package all compiled binaries
+    name: Package all compiled modules
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -168,60 +293,154 @@ jobs:
           path: dist
           merge-multiple: false
 
-      - name: Collect extensions into one flat directory
+      - name: Create one flattened ZIP per module
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          config = json.loads(Path("build/build_config.json").read_text(encoding="utf-8"))
+          if not isinstance(config, dict) or not config:
+              raise SystemExit("build_config.json must be a non-empty object keyed by module name")
+
+          dist_root = Path("dist")
+          zip_root = Path("final-zips")
+          if zip_root.exists():
+              shutil.rmtree(zip_root)
+          zip_root.mkdir(parents=True)
+
+          used_zip_names = set()
+          used_repo_paths = set()
+          commit_paths = []
+
+          for module_key, module_config in config.items():
+              if not isinstance(module_config, dict):
+                  raise SystemExit(f"Configuration for {module_key!r} must be an object")
+              artifacts = module_config.get("artifacts")
+              if not isinstance(artifacts, dict):
+                  raise SystemExit(f"{module_key}.artifacts must be an object")
+
+              zip_base = artifacts.get("name")
+              if (
+                  not isinstance(zip_base, str)
+                  or not zip_base
+                  or Path(zip_base).name != zip_base
+                  or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", zip_base)
+              ):
+                  raise SystemExit(
+                      f"{module_key}.artifacts.name must be a safe filename such as 'backend-compiled'"
+                  )
+              zip_name = zip_base if zip_base.lower().endswith(".zip") else f"{zip_base}.zip"
+              zip_name_key = zip_name.casefold()
+              if zip_name_key in used_zip_names:
+                  raise SystemExit(f"Duplicate artifact ZIP name (case-insensitive): {zip_name}")
+              used_zip_names.add(zip_name_key)
+
+              compiled = []
+              for matrix_artifact in dist_root.iterdir():
+                  module_dir = matrix_artifact / module_key
+                  if module_dir.is_dir():
+                      compiled.extend(path for path in module_dir.iterdir() if path.is_file())
+
+              if not compiled:
+                  raise SystemExit(f"No compiled extension files found for module {module_key!r}")
+
+              flattened_names = set()
+              for path in compiled:
+                  filename_key = path.name.casefold()
+                  if filename_key in flattened_names:
+                      raise SystemExit(
+                          f"Duplicate flattened filename for module {module_key!r}: {path.name}\n"
+                          f"Conflicting file: {path}"
+                      )
+                  flattened_names.add(filename_key)
+
+              zip_path = zip_root / zip_name
+              with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                  for path in sorted(compiled, key=lambda item: item.name.casefold()):
+                      archive.write(path, arcname=path.name)
+
+              print(f"Created {zip_path} with {len(compiled)} file(s):")
+              for path in sorted(compiled, key=lambda item: item.name.casefold()):
+                  print(f"  {path.name}")
+
+              commit_to_repo = artifacts.get("commit_to_repo", False)
+              if not isinstance(commit_to_repo, bool):
+                  raise SystemExit(f"{module_key}.artifacts.commit_to_repo must be true or false")
+              if commit_to_repo:
+                  repo_path_text = artifacts.get("repo_path", zip_name)
+                  if not isinstance(repo_path_text, str) or not repo_path_text:
+                      raise SystemExit(f"{module_key}.artifacts.repo_path must be a non-empty path")
+                  repo_path = PurePosixPath(repo_path_text)
+                  if repo_path.is_absolute() or ".." in repo_path.parts or "\\" in repo_path_text:
+                      raise SystemExit(
+                          f"{module_key}.artifacts.repo_path must remain inside the repository"
+                      )
+                  repo_path_text = repo_path.as_posix()
+                  repo_path_key = repo_path_text.casefold()
+                  if repo_path_text in ("", ".") or repo_path_key in used_repo_paths:
+                      raise SystemExit(f"Duplicate or invalid repo_path: {repo_path_text!r}")
+                  if "\n" in repo_path_text or "\r" in repo_path_text:
+                      raise SystemExit("repo_path cannot contain newline characters")
+                  used_repo_paths.add(repo_path_key)
+
+                  destination = Path(repo_path_text)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(zip_path, destination)
+                  commit_paths.append(repo_path_text)
+                  print(f"  Selected for repository commit: {repo_path_text}")
+
+          commit_file = Path(os.environ["RUNNER_TEMP"]) / "commit-paths.txt"
+          commit_file.write_text(
+              "".join(f"{path}\n" for path in commit_paths),
+              encoding="utf-8",
+          )
+          print(f"Prepared {len(used_zip_names)} final ZIP artifact(s).")
+          PY
+
+      - name: Upload all final ZIPs as one workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-modules-${{ github.run_id }}
+          path: final-zips/*.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Commit selected ZIPs to the repository
+        if: ${{ github.event_name != 'pull_request' }}
         shell: bash
         run: |
           set -euo pipefail
+          commit_file="$RUNNER_TEMP/commit-paths.txt"
 
-          mkdir -p package-root
-
-          # Flatten all compiled extensions from every build job.
-          while IFS= read -r -d '' file; do
-            name="${file##*/}"
-            destination="package-root/$name"
-
-            if [[ -e "$destination" ]]; then
-              echo "Duplicate filename detected: $name" >&2
-              echo "Source: $file" >&2
-              exit 1
-            fi
-
-            cp -- "$file" "$destination"
-          done < <(
-            find dist -type f \( -name '*.so' -o -name '*.pyd' \) -print0
-          )
-
-          if ! find package-root -maxdepth 1 -type f -print -quit | grep -q .; then
-            echo "No .so or .pyd files found." >&2
-            exit 1
+          if [[ ! -s "$commit_file" ]]; then
+            echo "No modules are configured with artifacts.commit_to_repo=true."
+            exit 0
           fi
 
-          echo "Files that will appear at the ZIP root:"
-          find package-root -maxdepth 1 -type f -printf '%f\n' | sort
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Create ZIP archive
-        shell: bash
-        run: |
-          cd package-root
-          zip -r ../backend-binaries.zip .
-          cd ..
+          while IFS= read -r path; do
+            [[ -n "$path" ]] && git add -f -- "$path"
+          done < "$commit_file"
 
-      - name: Commit and push ZIP to repo root
-        shell: bash
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Stage the zip file (overwriting/updating it at the repo root)
-          git add backend-binaries.zip
-          
-          if git diff --staged --quiet; then
-            echo "No changes to the compiled binaries ZIP file."
+          if git diff --cached --quiet; then
+            echo "No changes to the selected ZIP files."
           else
-            # [skip ci] prevents this commit from triggering the workflow again
-            git commit -m "Update compiled backend binaries ZIP [skip ci]"
+            git commit -m "Update compiled native modules [skip ci]"
             git push
           fi
+
+      - name: Explain skipped repository commits for pull requests
+        if: ${{ github.event_name == 'pull_request' }}
+        run: echo "Repository commits are skipped for pull_request events; all final ZIPs are still uploaded as an artifact."
 
   cleanup-intermediate-artifacts:
     name: Remove temporary per-version artifacts
@@ -243,7 +462,6 @@ jobs:
             const prefix = "networking-v2-build-";
             const allArtifacts = [];
 
-            // Collect all pages before deleting so pagination cannot skip entries.
             for (let page = 1; ; page++) {
               const response = await github.rest.actions.listWorkflowRunArtifacts({
                 owner,
@@ -261,7 +479,7 @@ jobs:
             );
 
             for (const artifact of temporary) {
-              core.info(`Deleting temporary artifact: ${artifact.name}`);
+              core.info(`Deleting temporary build artifact: ${artifact.name}`);
               await github.rest.actions.deleteArtifact({
                 owner,
                 repo,
@@ -269,4 +487,4 @@ jobs:
               });
             }
 
-            core.info(`Deleted ${temporary.length} temporary artifact(s).`);
+            core.info(`Deleted ${temporary.length} temporary build artifact(s).`);
