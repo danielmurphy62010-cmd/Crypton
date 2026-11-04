@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <objbase.h>
 #include <cfapi.h>
 #include <bcrypt.h>
 #include <pybind11/pybind11.h>
@@ -38,6 +39,13 @@
 namespace py = pybind11;
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
+struct WinFuseTransferDataParameters {
+    CF_OPERATION_TRANSFER_DATA_FLAGS Flags;
+    NTSTATUS CompletionStatus;
+    LPCVOID Buffer;
+    LARGE_INTEGER Offset;
+    LARGE_INTEGER Length;
+};
 namespace {
 constexpr std::size_t FETCH_CHUNK_SIZE = 16u * 1024u * 1024u;
 constexpr DWORD PAGE_SIZE = 4096;
@@ -417,8 +425,14 @@ public:
         }
         if (!need_or) return;
         sql += ")";
-        py::tuple params(values.size());
-        for (std::size_t i = 0; i < values.size(); ++i) params[i] = values[i];
+        PyObject* raw_tuple = PyTuple_New(static_cast<Py_ssize_t>(values.size()));
+        if (!raw_tuple) throw py::error_already_set();
+        py::tuple params = py::reinterpret_steal<py::tuple>(raw_tuple);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            PyObject* item = values[i].ptr();
+            Py_INCREF(item);
+            PyTuple_SET_ITEM(params.ptr(), static_cast<Py_ssize_t>(i), item);
+        }
         db_.attr("execute")(sql, params);
         db_.attr("commit")();
     }
@@ -1480,12 +1494,15 @@ private:
         op_info.TransferKey = request.transfer_key;
         op_info.RequestKey = request.request_key;
         CF_OPERATION_PARAMETERS op_params{};
-        op_params.ParamSize = static_cast<ULONG>(offsetof(CF_OPERATION_PARAMETERS, TransferData) + sizeof(op_params.TransferData));
-        op_params.TransferData.Flags = 0;
-        op_params.TransferData.CompletionStatus = completion_status;
-        op_params.TransferData.Buffer = buffer;
-        op_params.TransferData.Offset.QuadPart = static_cast<LONGLONG>(offset);
-        op_params.TransferData.Length.QuadPart = static_cast<LONGLONG>(transfer_length);
+        const std::size_t transfer_data_offset = offsetof(CF_OPERATION_PARAMETERS, TransferData);
+        auto* transfer_data = reinterpret_cast<WinFuseTransferDataParameters*>(
+            reinterpret_cast<unsigned char*>(&op_params) + transfer_data_offset);
+        transfer_data->Flags = CF_OPERATION_TRANSFER_DATA_FLAG_NONE;
+        transfer_data->CompletionStatus = static_cast<NTSTATUS>(completion_status);
+        transfer_data->Buffer = buffer;
+        transfer_data->Offset.QuadPart = static_cast<LONGLONG>(offset);
+        transfer_data->Length.QuadPart = static_cast<LONGLONG>(transfer_length);
+        op_params.ParamSize = static_cast<ULONG>(transfer_data_offset + sizeof(*transfer_data));
         HRESULT hr = CfExecute(&op_info, &op_params);
         if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
         check_hresult(hr, "CfExecute(TRANSFER_DATA)");
