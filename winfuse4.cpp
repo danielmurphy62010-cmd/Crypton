@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winternl.h>
 #include <objbase.h>
 #include <cfapi.h>
 #include <bcrypt.h>
