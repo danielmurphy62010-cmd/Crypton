@@ -1,6 +1,7 @@
 from cryptography.hazmat.primitives.serialization import load_der_private_key, load_der_public_key, load_pem_private_key, load_pem_public_key, Encoding, PrivateFormat, PublicFormat, NoEncryption, BestAvailableEncryption
 from cryptography.x509 import NameAttribute, Name, load_der_x509_certificate, CertificateBuilder, random_serial_number, BasicConstraints, load_pem_x509_certificate,DNSName,SubjectAlternativeName,IPAddress
-from cryptography.hazmat.primitives.asymmetric import x25519, ed25519, ec, ed448, x448
+from cryptography.hazmat.primitives.asymmetric import x25519, ed25519, ec, ed448, x448, rsa
+from cryptography.hazmat.primitives.asymmetric.padding import PSS, MGF1
 from cryptography.hazmat.primitives.ciphers.algorithms import AES, ChaCha20
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESGCM
 from cryptography.hazmat.primitives.ciphers import Cipher, modes
@@ -8,30 +9,39 @@ from datetime import datetime, timedelta, timezone
 from argon2.low_level import hash_secret_raw, Type
 from cryptography.hazmat.primitives import hashes
 from cryptography.x509.oid import NameOID
-import os, hmac, ipaddress, util, string, secrets
+import os, hmac, ipaddress, util, string, secrets, struct
 _KEY_TYPES = {0: ("x25519", 0, 32),1: ("x25519", 1, 32),2: ("ed25519", 0, 32),3: ("ed25519", 1, 32),4: ("x448", 0, 56),5: ("x448", 1, 56),6: ("ed448", 0, 57),7: ("ed448", 1, 57),}
 _ALGO_TAGS = {"x25519": 0,"ed25519": 2,"x448": 4,"ed448": 6}
 _ALGO_NUMS = {0:"x25519",2:"ed25519",4:"x448",6:"ed448"}
-def detect_key_type(data, algo=None, prv=None):
-    if not isinstance(data, (bytes, bytearray, memoryview)): raise TypeError("Framed key must be bytes-like")
+def detect_key_type(data, algo=None, prv=None, ignore_errors=False):
+    if not isinstance(data, (bytes, bytearray, memoryview)):raise TypeError("Framed key must be bytes-like")
     data = bytes(data)
-    if not data: raise ValueError("Missing key type tag")
+    if not data:raise ValueError("Missing key type tag")
     try: _algo, _prv, expected_length = _KEY_TYPES[data[0]]
-    except KeyError: raise ValueError("Unknown key type tag") from None
+    except KeyError:
+        if not ignore_errors:raise ValueError("Unknown key type tag") from None
+        else:return data, algo, prv
     key = data[1:]
-    if len(key) != expected_length: raise ValueError(f"Invalid {_algo} key length: expected {expected_length}, got {len(key)}")
+    if len(key) != expected_length:
+        if not ignore_errors:raise ValueError(f"Invalid {_algo} key length: expected {expected_length}, got {len(key)}")
+        else:return data, algo, prv
     if isinstance(algo, int): target_algos = [_ALGO_NUMS[algo]]
     elif isinstance(algo, str): target_algos = [algo]
     elif isinstance(algo, (list, tuple)): target_algos = [_ALGO_NUMS[a] if isinstance(a, int) else a for a in algo]
     else: target_algos = None
-    if target_algos is not None and _algo not in target_algos:raise TypeError(f'Unexpected algorithm: {_algo}, expected: {target_algos}')
+    if target_algos is not None and _algo not in target_algos:
+        if not ignore_errors:raise TypeError(f'Unexpected algorithm: {_algo}, expected: {target_algos}')
+        else:return data, algo, prv
     if prv is not None:
         expected_prv = 1 if prv else 0
-        if _prv != expected_prv:raise TypeError(f'Unexpected key type: {"private" if _prv else "public"}, expected: {"private" if prv else "public"}')
+        if _prv != expected_prv:
+            if not ignore_errors:raise TypeError(f'Unexpected key type: {"private" if _prv else "public"}, expected: {"private" if prv else "public"}')
+            else:return data, algo, prv
     return (key, _algo, _prv)
 def frame_key(key, algo, prv):
     if not isinstance(key, (bytes, bytearray, memoryview)):raise TypeError("Key must be bytes-like")
     key = bytes(key)
+    algo=_ALGO_NUMS.get(algo,algo)
     if algo not in _ALGO_TAGS:raise ValueError(f"Unsupported algorithm: {algo!r}")
     if type(prv) is bool:prv = int(prv)
     elif type(prv) is not int or prv not in (0, 1):raise ValueError("prv must be False, True, 0, or 1")
@@ -86,25 +96,67 @@ def gen_x25519(overkill=False) -> tuple[bytes, bytes]:private_key=(x448.X448Priv
 def shared_secret(prv:bytes, pub:bytes) -> bytes:
     if len(prv)!=len(pub):raise ValueError(f"Key length mismatch: {len(prv)} {len(pub)}")
     return load_keys(prv,algo=(0,4),type=1).exchange(load_keys(pub,algo=(0,4),type=2))
-def get_pub(data):
-    d=detect_key_type(data)
-    if d[-1]:return frame_key(load_keys(data, type=1).public_key().public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw),d[1],False)
-    else:return frame_key(d[0],d[1],False)
+def get_pub(data,PEM=False):
+    k=load_keys(data)
+    if hasattr(k,'public_key'):k=k.public_key()
+    if not PEM:
+        if isinstance(k, ed25519.Ed25519PublicKey):return frame_key(k.public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw),2,False)
+        if isinstance(k, ed448.Ed448PublicKey):return frame_key(k.public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw),6,False)
+        if isinstance(k, x25519.X25519PublicKey):return frame_key(k.public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw),0,False)
+        if isinstance(k, x448.X448PublicKey):return frame_key(k.public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw),4,False)
+        else:return k.public_bytes(encoding=Encoding.DER,format=PublicFormat.SubjectPublicKeyInfo)
+    else:return k.public_bytes(encoding=Encoding.PEM, format=PublicFormat.SubjectPublicKeyInfo)
 def gen_ed25519(overkill=False) -> tuple[bytes, bytes]:private_key = (ed448.Ed448PrivateKey if overkill else ed25519.Ed25519PrivateKey).generate();return frame_key(private_key.private_bytes(encoding=Encoding.Raw,format=PrivateFormat.Raw,encryption_algorithm=NoEncryption()),'ed448' if overkill else 'ed25519', True), frame_key(private_key.public_key().public_bytes(encoding=Encoding.Raw,format=PublicFormat.Raw,),'ed448' if overkill else 'ed25519', False)
 def ed25519_sign(prv:bytes, data:bytes) -> bytes:return load_keys(prv, type=1, algo=(2,6)).sign(data) + data
 def ed25519_verify(pub:bytes, data:bytes) -> bytes:d=detect_key_type(pub,(2,6),False);sig_len = 114 if len(d[0]) == 57 else 64;load_keys(pub, type=2).verify(data[:sig_len], data[sig_len:]);return data[sig_len:]
-# generate_tls is black magic, and I don't really trust it THAT much, but it gets the job done
-def generate_tls(cert_path,key_path,common_name="TLS Certificate",country=None,state=None,locality=None,organization=None,organizational_unit=None,email=None,valid_days=3650,san_ips=None,san_dns=None):
-    if os.path.exists(cert_path) and os.path.exists(key_path):return
-    san_ips,san_dns=san_ips or [],san_dns or []
-    key=ec.generate_private_key(ec.SECP256R1())
-    subject=Name([NameAttribute(oid,value) for oid,value in [(NameOID.COMMON_NAME,common_name),(NameOID.COUNTRY_NAME,country),(NameOID.STATE_OR_PROVINCE_NAME,state),(NameOID.LOCALITY_NAME,locality),(NameOID.ORGANIZATION_NAME,organization),(NameOID.ORGANIZATIONAL_UNIT_NAME,organizational_unit),(NameOID.EMAIL_ADDRESS,email)] if value])
-    san_entries=[IPAddress(ipaddress.ip_address(ip)) for ip in san_ips]+[DNSName(dns) for dns in san_dns]
-    cert=CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(key.public_key()).serial_number(random_serial_number()).not_valid_before(datetime.now(timezone.utc)-timedelta(days=1)).not_valid_after(datetime.now(timezone.utc)+timedelta(days=valid_days)).add_extension(BasicConstraints(ca=False,path_length=None),critical=True)
-    if san_entries:cert=cert.add_extension(SubjectAlternativeName(san_entries),critical=False)
-    cert=cert.sign(key,hashes.SHA256())
-    with open(key_path,"wb") as f:f.write(key.private_bytes(Encoding.PEM,PrivateFormat.PKCS8,NoEncryption()))
-    with open(cert_path,"wb") as f:f.write(cert.public_bytes(Encoding.PEM))
+def sign(prv, data):
+    try:
+        detect_key_type(prv, (2,6), True)
+        return ed25519_sign(prv,data)
+    except:pass
+    key = load_keys(prv, type=1)
+    if isinstance(key, ec.EllipticCurvePrivateKey):
+        curve_name = key.curve.name.lower()
+        if "384" in curve_name:h = hashes.SHA384()
+        elif "521" in curve_name:h = hashes.SHA512()
+        else:h = hashes.SHA256()
+        sig = key.sign(data, ec.ECDSA(h))
+    elif isinstance(key, rsa.RSAPrivateKey):sig = key.sign(data,PSS(mgf=MGF1(hashes.SHA256()),salt_length=PSS.MAX_LENGTH),hashes.SHA256())
+    else:raise TypeError(f"Unsupported private key type for signing: {type(key)}")
+    return struct.pack('>q', len(sig)) + sig + data
+def verify(pub, data):
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 8:raise ValueError("Invalid signature packet: too short")
+    sig_len = struct.unpack('>q', data[:8])[0]
+    if len(data) < 8 + sig_len:raise ValueError("Invalid signature packet length")
+    sig = data[8:8 + sig_len]
+    try:
+        detect_key_type(pub, (2,6), False)
+        return ed25519_verify(pub,data)
+    except:pass
+    key = load_keys(pub, type=2)
+    data = data[8 + sig_len:]
+    if isinstance(key, ec.EllipticCurvePublicKey):
+        curve_name = key.curve.name.lower()
+        if "384" in curve_name:h = hashes.SHA384()
+        elif "521" in curve_name:h = hashes.SHA512()
+        else:h = hashes.SHA256()
+        key.verify(sig, data, ec.ECDSA(h))
+    elif isinstance(key, rsa.RSAPublicKey):key.verify(sig,data,PSS(mgf=MGF1(hashes.SHA256()),salt_length=PSS.MAX_LENGTH),hashes.SHA256())
+    else:raise TypeError(f"Unsupported public key type for verification: {type(key)}")
+    return data
+def generate_tls(cert_path=None, key_path=None, common_name="TLS Certificate", country=None, state=None, locality=None, organization=None, organizational_unit=None, email=None, valid_days=3650, san_ips=None, san_dns=None):
+    if all([x is not None and os.path.exists(x) for x in [cert_path,key_path]]):return
+    san_ips, san_dns = san_ips or [], san_dns or []
+    key = ec.generate_private_key(ec.SECP384R1())
+    subject = Name([NameAttribute(oid, value) for oid, value in [(NameOID.COMMON_NAME, common_name),(NameOID.COUNTRY_NAME, country),(NameOID.STATE_OR_PROVINCE_NAME, state),(NameOID.LOCALITY_NAME, locality),(NameOID.ORGANIZATION_NAME, organization),(NameOID.ORGANIZATIONAL_UNIT_NAME, organizational_unit),(NameOID.EMAIL_ADDRESS, email)] if value])
+    san_entries = [IPAddress(ipaddress.ip_address(ip)) for ip in san_ips] + [DNSName(dns) for dns in san_dns]
+    cert = (CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(key.public_key()).serial_number(random_serial_number()).not_valid_before(datetime.now(timezone.utc) - timedelta(days=1)).not_valid_after(datetime.now(timezone.utc) + timedelta(days=valid_days)).add_extension(BasicConstraints(ca=False, path_length=None), critical=True))
+    if san_entries:cert = cert.add_extension(SubjectAlternativeName(san_entries), critical=False)
+    cert=cert.sign(key, hashes.SHA384())
+    if not (cert_path is None or key_path is None):
+        with open(key_path, "wb") as f:f.write(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+        with open(cert_path, "wb") as f:f.write(cert.public_bytes(Encoding.PEM))
+    return key.private_bytes(Encoding.PEM,PrivateFormat.PKCS8, NoEncryption()),cert.public_bytes(Encoding.PEM)
 def gen_CA(prv_path,pub_path,cert_path,password=None,common_name=None,country=None,state=None,locality=None,organization=None,organizational_unit=None,email=None,valid_days=3650,overkill=False):
     prv = ed448.Ed448PrivateKey.generate() if overkill else ed25519.Ed25519PrivateKey.generate()
     pub=prv.public_key()
@@ -120,9 +172,7 @@ def gen_CA(prv_path,pub_path,cert_path,password=None,common_name=None,country=No
     with open(prv_path,'wb') as f:f.write(prv.private_bytes(Encoding.PEM if prv_path.lower().endswith('.pem') else Encoding.DER,PrivateFormat.PKCS8,BestAvailableEncryption(password) if password else NoEncryption()))
     with open(pub_path,'wb') as f:f.write(pub.public_bytes(Encoding.PEM if pub_path.lower().endswith('.pem') else Encoding.DER,PublicFormat.SubjectPublicKeyInfo))
     with open(cert_path,'wb') as f:f.write(CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(pub).serial_number(random_serial_number()).not_valid_before(datetime.now(timezone.utc)-timedelta(days=1)).not_valid_after(datetime.now(timezone.utc)+timedelta(days=valid_days)).add_extension(BasicConstraints(ca=True,path_length=None),critical=True).sign(prv,None).public_bytes(Encoding.PEM if cert_path.lower().endswith('.pem') else Encoding.DER))
-def gen_keys(prv_path,pub_path,cert_path,ca_prv_path,ca_cert_path,password=None,ca_password=None,common_name=None,country=None,state=None,locality=None,organization=None,organizational_unit=None,email=None,valid_days=3650,overkill=False):
-    with open(ca_prv_path,'rb') as f:ca_priv=load_der_private_key(f.read(),password=ca_password)
-    with open(ca_cert_path,'rb') as f:ca_cert=load_der_x509_certificate(f.read())
+def gen_keys(prv_path,pub_path,cert_path,ca_prv,ca_cert,password=None,common_name=None,country=None,state=None,locality=None,organization=None,organizational_unit=None,email=None,valid_days=3650,overkill=False):
     prv=(ed448.Ed448PrivateKey.generate() if overkill else ed25519.Ed25519PrivateKey.generate())
     pub=prv.public_key()
     name_attributes=[]
@@ -135,7 +185,7 @@ def gen_keys(prv_path,pub_path,cert_path,ca_prv_path,ca_cert_path,password=None,
     if email:name_attributes.append(NameAttribute(NameOID.EMAIL_ADDRESS,email))
     with open(prv_path,'wb') as f:f.write(prv.private_bytes(Encoding.DER,PrivateFormat.PKCS8,BestAvailableEncryption(password) if password else NoEncryption()))
     with open(pub_path,'wb') as f:f.write(pub.public_bytes(Encoding.DER,PublicFormat.SubjectPublicKeyInfo))
-    with open(cert_path,'wb') as f:f.write(CertificateBuilder().subject_name(Name(name_attributes)).issuer_name(ca_cert.subject).public_key(pub).serial_number(random_serial_number()).not_valid_before(datetime.now(timezone.utc)-timedelta(days=1)).not_valid_after(datetime.now(timezone.utc)+timedelta(days=valid_days)).add_extension(BasicConstraints(ca=False,path_length=None),critical=True).sign(ca_priv,None).public_bytes(Encoding.DER))
+    with open(cert_path,'wb') as f:f.write(CertificateBuilder().subject_name(Name(name_attributes)).issuer_name(load_keys(ca_cert,algo=3).subject).public_key(pub).serial_number(random_serial_number()).not_valid_before(datetime.now(timezone.utc)-timedelta(days=1)).not_valid_after(datetime.now(timezone.utc)+timedelta(days=valid_days)).add_extension(BasicConstraints(ca=False,path_length=None),critical=True).sign(load_keys(ca_prv,type=1),None).public_bytes(Encoding.DER))
 def validate_keys(prv,pub,cert=None):
     pub_bytes = load_keys(pub,type=2).public_bytes(Encoding.Raw,PublicFormat.Raw)
     if not hmac.compare_digest(load_keys(prv,type=1).public_key().public_bytes(Encoding.Raw,PublicFormat.Raw), pub_bytes):return False
@@ -148,23 +198,26 @@ def load_keys(key, password=None, type=0, algo=None):
     k = key.lstrip() if isinstance(key, bytes) else key
     if isinstance(key, (bytes, bytearray)):
         if k.startswith(b'-----BEGIN'):
-            if type in (0, 1) and b'PRIVATE KEY' in k: return load_pem_private_key(key, password=password)
-            if type in (0, 2) and b'PUBLIC KEY' in k: return load_pem_public_key(key)
-            if type in (0, 3) and b'CERTIFICATE' in k: return load_pem_x509_certificate(key)
+            if type in (0, 1) and b'PRIVATE' in k:return load_pem_private_key(key, password=password)
+            if type in (0, 2) and b'PUBLIC' in k:return load_pem_public_key(key)
+            if type in (0, 2) and b'CERTIFICATE' in k:return load_pem_x509_certificate(key).public_key()
+            if type in (0, 3) and b'CERTIFICATE' in k:return load_pem_x509_certificate(key)
         if type in (0, 1):
-            try: return load_der_private_key(key, password=password)
+            try:return load_der_private_key(key, password=password)
             except Exception: pass
         if type in (0, 2):
-            try: return load_der_public_key(key)
+            try:return load_der_public_key(key)
             except Exception: pass
         if type in (0, 3):
-            try: return load_der_x509_certificate(key)
+            try:return load_der_x509_certificate(key)
             except Exception: pass
         expected_prv = True if type == 1 else (False if type == 2 else None)
-        key_bytes, _algo, _is_prv = detect_key_type(key, algo=algo, prv=expected_prv)
-        match _algo:
-            case 'x25519':return x25519.X25519PrivateKey.from_private_bytes(key_bytes) if _is_prv else x25519.X25519PublicKey.from_public_bytes(key_bytes)
-            case 'x448':return x448.X448PrivateKey.from_private_bytes(key_bytes) if _is_prv else x448.X448PublicKey.from_public_bytes(key_bytes)
-            case 'ed25519':return ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes) if _is_prv else ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)
-            case 'ed448':return ed448.Ed448PrivateKey.from_private_bytes(key_bytes) if _is_prv else ed448.Ed448PublicKey.from_public_bytes(key_bytes)
+        try:
+            key_bytes, _algo, _is_prv = detect_key_type(key, algo=algo, prv=expected_prv)
+            match _algo:
+                case 'x25519':return x25519.X25519PrivateKey.from_private_bytes(key_bytes) if _is_prv else x25519.X25519PublicKey.from_public_bytes(key_bytes)
+                case 'x448':return x448.X448PrivateKey.from_private_bytes(key_bytes) if _is_prv else x448.X448PublicKey.from_public_bytes(key_bytes)
+                case 'ed25519':return ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes) if _is_prv else ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)
+                case 'ed448':return ed448.Ed448PrivateKey.from_private_bytes(key_bytes) if _is_prv else ed448.Ed448PublicKey.from_public_bytes(key_bytes)
+        except Exception as e:raise ValueError("Unsupported key format") from e
     raise ValueError("Unsupported key format")

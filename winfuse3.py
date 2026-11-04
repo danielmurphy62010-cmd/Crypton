@@ -1,4 +1,4 @@
-import os, time, ctypes, shutil, stat, uuid, threading, sqlite3, hashlib
+import os, time, ctypes, shutil, stat, uuid, threading, sqlite3, hashlib, queue
 from dataclasses import dataclass
 from ctypes import wintypes
 from watchdog.observers import Observer
@@ -28,7 +28,8 @@ class BackingStore:
     def lexists(self, relative_path):raise NotImplementedError
     def delete(self, relative_path, is_directory):raise NotImplementedError
     def move(self, source_relative_path, destination_relative_path):raise NotImplementedError
-    def get_hash(self, relative_path):return None  # Optional hash function
+    def get_size(self, relative_path):return self.stat(relative_path).size
+    def get_hash(self, relative_path):return None
     def describe(self):return type(self).__name__
 cldapi=ctypes.WinDLL("cldapi.dll",use_last_error=True)
 kernel32=ctypes.WinDLL("kernel32.dll",use_last_error=True)
@@ -80,6 +81,77 @@ FILE_SHARE_WRITE=0x02
 FILE_SHARE_DELETE=0x04
 OPEN_EXISTING=3
 INVALID_HANDLE_VALUE=ctypes.c_void_p(-1).value
+IGNORE_WRITE=set()
+IGNORE_WRITE_LOCK=threading.Lock()
+IGNORE_WRITE_WINDOWS={}
+IGNORE_WRITE_TTL=600.0
+IGNORE_WRITE_EVENT_COALESCE=0.5
+class TimestampedEventQueue(queue.Queue):
+    def put(self,item,block=True,timeout=None):
+        if isinstance(item,tuple) and len(item)==2:
+            event=item[0]
+            try:setattr(event,"_winfuse_occurred_at",time.monotonic())
+            except (AttributeError,TypeError):
+                try:object.__setattr__(event,"_winfuse_occurred_at",time.monotonic())
+                except (AttributeError,TypeError):pass
+        return super().put(item,block,timeout)
+def _event_occurred_at(event):
+    value=getattr(event,"_winfuse_occurred_at",None)
+    return float(value) if value is not None else None
+def _ignore_write_key(path):
+    normalized=os.path.abspath(os.path.normpath(path))
+    if normalized.startswith("\\\\?\\UNC\\"):
+        normalized="\\\\"+normalized[8:]
+    elif normalized.startswith("\\\\?\\"):
+        normalized=normalized[4:]
+    return os.path.normcase(normalized)
+def _add_ignore_write(path):
+    if path is None:return
+    key=_ignore_write_key(path)
+    now=time.monotonic()
+    until=now+IGNORE_WRITE_EVENT_COALESCE
+    with IGNORE_WRITE_LOCK:
+        windows=IGNORE_WRITE_WINDOWS.get(key,[])
+        windows=[(start,end) for start,end in windows if now-end<=IGNORE_WRITE_TTL]
+        if windows and now<=windows[-1][1]:
+            start,end=windows[-1]
+            windows[-1]=(start,max(end,until))
+        else:
+            windows.append((now,until))
+        IGNORE_WRITE_WINDOWS[key]=windows
+        IGNORE_WRITE.add(key)
+        if len(IGNORE_WRITE_WINDOWS)>4096:
+            for stale_key,stale_windows in tuple(IGNORE_WRITE_WINDOWS.items()):
+                if stale_windows and now-stale_windows[-1][1]>IGNORE_WRITE_TTL:
+                    IGNORE_WRITE_WINDOWS.pop(stale_key,None)
+                    IGNORE_WRITE.discard(stale_key)
+def _consume_ignore_write(path,occurred_at=None):
+    if path is None:return False
+    key=_ignore_write_key(path)
+    event_time=time.monotonic() if occurred_at is None else float(occurred_at)
+    with IGNORE_WRITE_LOCK:
+        windows=IGNORE_WRITE_WINDOWS.get(key)
+        if not windows:return False
+        matched=False
+        remaining=[]
+        for start,end in windows:
+            if event_time<start:
+                remaining.append((start,end))
+            elif event_time<=end:
+                matched=True
+                remaining.append((start,end))
+        if remaining:
+            IGNORE_WRITE_WINDOWS[key]=remaining
+        else:
+            IGNORE_WRITE_WINDOWS.pop(key,None)
+            IGNORE_WRITE.discard(key)
+        return matched
+def _discard_ignore_write(path):
+    if path is None:return
+    key=_ignore_write_key(path)
+    with IGNORE_WRITE_LOCK:
+        IGNORE_WRITE.discard(key)
+        IGNORE_WRITE_WINDOWS.pop(key,None)
 def hresult_unsigned(hr):return int(hr)&0xFFFFFFFF
 def hresult_hex(hr):return f"0x{hresult_unsigned(hr):08X}"
 def check_hresult(hr,operation):
@@ -174,11 +246,14 @@ def mount_path_to_backend_path(mount_path):
     if relative == ".":return ""
     if relative == ".." or relative.startswith(".." + os.sep) or os.path.isabs(relative):return None
     return relative.replace(os.sep, "/")
-def callback_path_to_backend_path(info):
+def callback_path_to_mount_path(info):
     volume = info.VolumeDosName
     normalized = info.NormalizedPath
     if not volume or not normalized:return None
-    full_mount_path = os.path.normpath(volume + normalized)
+    return os.path.abspath(os.path.normpath(volume + normalized))
+def callback_path_to_backend_path(info):
+    full_mount_path = callback_path_to_mount_path(info)
+    if full_mount_path is None:return None
     return mount_path_to_backend_path(full_mount_path)
 def build_placeholder_info(backend_directory, entry_name, st):
     is_directory = st.is_directory
@@ -202,10 +277,30 @@ def build_placeholder_info(backend_directory, entry_name, st):
     placeholder.CreateUsn = 0
     return placeholder, name_buffer, identity_buffer, relative_identity
 def hash_local_file(path):
-    h=hashlib.sha256()
+    h=hashlib.sha512()
     with open(path,"rb") as f:
         for chunk in iter(lambda:f.read(1024*1024*16),b""):h.update(chunk)
     return h.hexdigest()
+def placeholder_data_is_fully_local(info, logical_size):
+    logical_size=max(0,int(logical_size))
+    if logical_size==0:return True
+    on_disk=int(info.OnDiskDataSize.QuadPart)
+    validated=int(info.ValidatedDataSize.QuadPart)
+    modified=int(info.ModifiedDataSize.QuadPart)
+    return on_disk>=logical_size and validated+modified>=logical_size
+def get_placeholder_modified_data_size(path):
+    attrs=get_win_attributes(path)
+    if attrs is None or not attrs&FILE_ATTRIBUTE_REPARSE_POINT:return None
+    handle=kernel32.CreateFileW(path,FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,None,OPEN_EXISTING,0,None)
+    if not handle or handle==INVALID_HANDLE_VALUE:return None
+    try:
+        buf=ctypes.create_string_buffer(8192)
+        returned=wintypes.DWORD()
+        hr=cldapi.CfGetPlaceholderInfo(handle,CF_PLACEHOLDER_INFO_STANDARD,buf,len(buf),ctypes.byref(returned))
+        if hr!=0:return None
+        info=ctypes.cast(buf,ctypes.POINTER(CF_PLACEHOLDER_STANDARD_INFO)).contents
+        return max(0,int(info.ModifiedDataSize.QuadPart))
+    finally:kernel32.CloseHandle(handle)
 def get_local_hash(path):
     attrs=get_win_attributes(path)
     if attrs is None or attrs&FILE_ATTRIBUTE_DIRECTORY:return None
@@ -218,7 +313,8 @@ def get_local_hash(path):
             hr=cldapi.CfGetPlaceholderInfo(handle,CF_PLACEHOLDER_INFO_STANDARD,buf,len(buf),ctypes.byref(returned))
             if hr!=0:return None
             info=ctypes.cast(buf,ctypes.POINTER(CF_PLACEHOLDER_STANDARD_INFO)).contents
-            if info.OnDiskDataSize.QuadPart<os.path.getsize(path) and info.ModifiedDataSize.QuadPart==0:return None
+            logical_size=os.path.getsize(path)
+            if not placeholder_data_is_fully_local(info,logical_size):return None
         finally:kernel32.CloseHandle(handle)
     return hash_local_file(path)
 def create_single_placeholder(backend,backend_directory,entry_name,mount_directory,mark_internal=None,):
@@ -228,12 +324,14 @@ def create_single_placeholder(backend,backend_directory,entry_name,mount_directo
     placeholder,name_buffer,identity_buffer,relative_identity = build_placeholder_info(backend_directory, entry_name, st)
     placeholder_array = (CF_PLACEHOLDER_CREATE_INFO * 1)(placeholder)
     processed = wintypes.DWORD(0)
+    mount_path = os.path.join(mount_directory, entry_name)
+    if mark_internal is not None:mark_internal(mount_path, False, True)
     hr = cldapi.CfCreatePlaceholders(ctypes.c_wchar_p(mount_directory),placeholder_array,1,CF_CREATE_FLAG_NONE,ctypes.byref(processed),)
     check_hresult(hr, f"CfCreatePlaceholders({backend_path})")
     if processed.value != 1:raise OSError(f"CfCreatePlaceholders processed {processed.value}/1 entries for {backend_path}")
     result = int(placeholder_array[0].Result)
     if result != 0:raise OSError(f"Placeholder creation failed for {backend_path}: NTSTATUS 0x{result & 0xFFFFFFFF:08X}")
-    if mark_internal is not None:mark_internal(os.path.join(mount_directory, entry_name))
+    if mark_internal is not None:mark_internal(mount_path)
     return True
 def remove_stale_mount_entry(path, mark_internal=None):
     path = os.path.abspath(path)
@@ -275,7 +373,7 @@ def set_mount_file_sync_state(mount_path, in_sync=True):
             return False
         return True
     finally:cldapi.CfCloseHandle(handle)
-def update_mount_file_from_server(backend,backend_path,mount_path,mark_internal):
+def update_mount_file_from_server(backend,backend_path,mount_path,mark_internal,dehydrate=True):
     try:st=backend.stat(backend_path)
     except Exception as e:
         print(f"Cannot stat {backend_path}: {e}")
@@ -317,9 +415,9 @@ def update_mount_file_from_server(backend,backend_path,mount_path,mark_internal)
         metadata.BasicInfo.FileAttributes=FILE_ATTRIBUTE_NORMAL
         metadata.FileSize=make_large_integer(st.size)
         identity,n=make_identity(join_backend_path(backend_dir,name))
-        flags=CF_UPDATE_FLAG_MARK_IN_SYNC|CF_UPDATE_FLAG_DEHYDRATE|CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA
-        # Mark before the mutation because its filesystem event can arrive immediately.
-        if mark_internal:mark_internal(mount_path, True)
+        flags=CF_UPDATE_FLAG_MARK_IN_SYNC|CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA
+        if dehydrate:flags|=CF_UPDATE_FLAG_DEHYDRATE
+        if mark_internal:mark_internal(mount_path, True, True)
         hr=cldapi.CfUpdatePlaceholder(handle,ctypes.byref(metadata),ctypes.cast(identity,ctypes.c_void_p),n,None,0,flags,None,None)
         if hr!=0:
             print(f"CfUpdatePlaceholder failed for {mount_path}: {hresult_hex(hr)}")
@@ -373,73 +471,58 @@ def check_server_file_updates(backend, mount_directory, journal,is_busy, mark_in
     for _, backend_path, st, state in selected:
         now = time.time()
         old_hash = state["hash"] if state else None
-        old_local = state["local_hash"] if state else None
+        old_local = state.get("local_hash") if state else None
         old_mtime = state.get("backing_mtime") if state else None
         unchanged = int(state.get("unchanged_checks") or 0) if state else 0
         try:
             if not backend.lexists(backend_path):
                 journal.delete_file_hash_state(backend_path)
                 continue
+            new_size = int(backend.get_size(backend_path))
             new_hash = backend.get_hash(backend_path)
             if new_hash is None:
                 journal.set_file_hash_state(backend_path, old_hash, now, 5, old_local)
-                journal.schedule_file_check(backend_path, now + 5,st.modified_time, unchanged)
+                journal.schedule_file_check(backend_path, now + 5, st.modified_time, unchanged)
                 continue
-            mount_path = os.path.join(mount_directory,backend_path.replace("/", os.sep))
-            backing_changed = (state is not None and old_hash is not None and new_hash != old_hash)
-            if (state is None or old_hash is None or new_hash != old_hash or get_win_attributes(mount_path) is None):
-                if update_mount_file_from_server(backend, backend_path, mount_path, mark_internal):
-                    journal.set_file_hash_state(backend_path, new_hash, now, 5, new_hash)
-                    unchanged = 0
-                else:
+            mount_path = os.path.join(mount_directory, backend_path.replace("/", os.sep))
+            attrs = get_win_attributes(mount_path)
+            backing_changed = (state is None or old_hash is None or new_hash != old_hash)
+            mtime_changed = (old_mtime is not None and st.modified_time != old_mtime)
+            mount_missing = attrs is None
+            mount_size = None
+            if not mount_missing:
+                try:mount_size = os.stat(mount_path).st_size
+                except OSError:mount_missing = True
+            size_changed = (not mount_missing and mount_size != new_size)
+            modified_data_size = get_placeholder_modified_data_size(mount_path) if attrs is not None else None
+            if modified_data_size is None and attrs is not None and attrs & FILE_ATTRIBUTE_REPARSE_POINT:
+                journal.set_file_hash_state(backend_path, old_hash, now, 5, old_local)
+                journal.schedule_file_check(backend_path, now + 5, st.modified_time, unchanged)
+                continue
+            if modified_data_size:
+                journal.set_file_hash_state(backend_path, old_hash, now, 5, old_local)
+                journal.schedule_file_check(backend_path, now + 5, st.modified_time, unchanged)
+                continue
+            if mount_missing or backing_changed or size_changed:
+                if not update_mount_file_from_server(backend, backend_path, mount_path, mark_internal, dehydrate=True):
                     journal.set_file_hash_state(backend_path, old_hash, now, 5, old_local)
                     journal.schedule_file_check(backend_path, now + 5, st.modified_time, unchanged)
                     print(f"[refresh] failed: {backend_path}; retrying")
                     continue
-                journal.schedule_file_check(backend_path, now + 5,st.modified_time, 0)
-                continue
-            local_hash = get_local_hash(mount_path)
-            if local_hash is None:
-                journal.set_file_hash_state(backend_path, new_hash, now, 5,old_local or new_hash)
-                journal.schedule_file_check(backend_path, now + 5,st.modified_time, unchanged)
-                continue
-            if old_local is None:
-                if local_hash != new_hash:
-                    if update_mount_file_from_server(backend, backend_path, mount_path, mark_internal):journal.set_file_hash_state(backend_path, new_hash, now, 5, new_hash)
-                    else:
-                        journal.set_file_hash_state(backend_path, old_hash, now, 5, None)
-                        journal.schedule_file_check(backend_path, now + 5,st.modified_time, unchanged)
-                        continue
-                else:journal.set_file_hash_state(backend_path, new_hash, now, 5, local_hash)
-            elif local_hash == old_local or local_hash == new_hash:journal.set_file_hash_state(backend_path, new_hash, now, 5, local_hash)
-            else:
-                latest = backend.get_hash(backend_path)
-                if latest != new_hash:
-                    if latest is not None and update_mount_file_from_server(backend, backend_path, mount_path, mark_internal):journal.set_file_hash_state(backend_path, latest, now, 5, latest)
-                    else:journal.set_file_hash_state(backend_path, old_hash, now, 5, old_local)
-                    journal.schedule_file_check(backend_path, now + 5,st.modified_time, unchanged)
+            elif mtime_changed:
+                if not update_mount_file_from_server(backend, backend_path, mount_path, mark_internal, dehydrate=False):
+                    journal.set_file_hash_state(backend_path, old_hash, now, 5, old_local)
+                    journal.schedule_file_check(backend_path, now + 5, st.modified_time, unchanged)
                     continue
-                backend.write_file_from_local(mount_path, backend_path)
-                committed = backend.get_hash(backend_path)
-                if committed is None:raise OSError("Could not verify uploaded backing hash")
-                if committed != local_hash:
-                    if update_mount_file_from_server(backend, backend_path, mount_path, mark_internal):journal.set_file_hash_state(backend_path, committed, now, 5, committed)
-                    else:journal.set_file_hash_state(backend_path, old_hash, now, 5, old_local)
-                    journal.schedule_file_check(backend_path, now + 5,st.modified_time, unchanged)
-                    continue
-                attrs = get_win_attributes(mount_path)
-                if attrs is not None and attrs & FILE_ATTRIBUTE_REPARSE_POINT:
-                    if not set_mount_file_sync_state(mount_path, True):print(f"[refresh] Warning: uploaded, but could not mark in sync: {mount_path}")
-                journal.set_file_hash_state(backend_path, committed, now, 5, local_hash)
-            mtime_changed = (old_mtime is not None and st.modified_time != old_mtime)
-            if backing_changed or mtime_changed:unchanged = 0
+            journal.set_file_hash_state(backend_path, new_hash, now, 5, new_hash)
+            if backing_changed or mtime_changed or size_changed:unchanged = 0
             else:unchanged = min(unchanged + 1, 5)
             interval = min(5 * (unchanged + 1), 30)
-            journal.schedule_file_check(backend_path,time.time() + interval,st.modified_time,unchanged,)
+            journal.schedule_file_check(backend_path, time.time() + interval, st.modified_time, unchanged)
         except Exception as e:
             retry_time = time.time() + 5
             journal.set_file_hash_state(backend_path, old_hash, time.time(), 5, old_local)
-            journal.schedule_file_check(backend_path, retry_time,st.modified_time, unchanged)
+            journal.schedule_file_check(backend_path, retry_time, st.modified_time, unchanged)
             print(f"[refresh] error for {backend_path}: {e}; retrying in 5 seconds")
 def refresh_directory(backend,backend_directory,mount_directory,is_busy,mark_internal=None,journal=None):
     if is_busy(backend_directory):return
@@ -451,7 +534,15 @@ def refresh_directory(backend,backend_directory,mount_directory,is_busy,mark_int
     for name in sorted(backend_names-mount_names):
         bp=join_backend_path(backend_directory,name)
         if is_busy(bp):continue
-        try:create_single_placeholder(backend,backend_directory,name,mount_directory,mark_internal)
+        try:
+            created=create_single_placeholder(backend,backend_directory,name,mount_directory,mark_internal)
+            if created and journal and type(backend).get_hash is not BackingStore.get_hash:
+                remote_hash=backend.get_hash(bp)
+                if remote_hash is not None:
+                    now=time.time()
+                    st=backend.stat(bp)
+                    journal.set_file_hash_state(bp,remote_hash,now,5,remote_hash)
+                    journal.schedule_file_check(bp,now+5,st.modified_time,0)
         except Exception as e:print(f"Cannot create {bp}: {e}")
     for name in sorted(mount_names-backend_names):
         bp=join_backend_path(backend_directory,name)
@@ -534,6 +625,7 @@ def on_fetch_data(callback_info_ptr, callback_parameters_ptr):
         logical_size = max(0, int(info.FileSize.QuadPart))
         backend = ACTIVE_BACKING_STORE
         backend_path = callback_path_to_backend_path(info)
+        mount_path = (os.path.abspath(os.path.join(MOUNT_DIR, backend_path.replace("/", os.sep))) if backend_path is not None else None)
     except Exception as exc:
         print(f"Invalid FETCH_DATA callback: {exc}")
         return
@@ -563,9 +655,11 @@ def on_fetch_data(callback_info_ptr, callback_parameters_ptr):
                     f.seek(current_offset)
                     data = f.read(chunk_size)
                     if len(data) != chunk_size:raise IOError(f"Short read from {backend_path}: wanted {chunk_size}, got {len(data)}")
+                    _add_ignore_write(mount_path)
                     _cf_execute_transfer_data(connection_key,transfer_key,request_key,current_offset,data=data,completion_status=STATUS_SUCCESS,)
                     current_offset += len(data)
         except Exception as exc:
+            _discard_ignore_write(mount_path)
             print(f"FETCH_DATA failed for {backend_path!r}: {exc}")
             try:_cf_fail_fetch(connection_key,transfer_key,request_key,offset,length,logical_size,)
             except Exception as completion_exc:print(f"Could not complete failed FETCH_DATA for {backend_path!r}: {completion_exc}")
@@ -665,19 +759,15 @@ class MountSyncHandler(FileSystemEventHandler):
         self._internal_paths = {}
     def _get_backend_path(self, mount_path):return mount_path_to_backend_path(mount_path)
     def _folder_for(self, backend_path):return os.path.dirname(backend_path).replace("\\", "/")
-    def _mark_internal(self, path, allow_delete=False):
+    def _mark_internal(self, path, allow_delete=False, allow_change=False):
         path = os.path.abspath(path)
         signature = mount_path_signature(path)
         now = time.monotonic()
         with self._lock:
             previous = self._internal_paths.get(path)
-            # Preserve the delete allowance when a replacement is marked again
-            # after its new placeholder has been created.
-            preserve_delete = bool(
-                allow_delete
-                or (previous is not None and previous[0] > now and len(previous) > 2 and previous[2])
-            )
-            self._internal_paths[path] = (now + 2.0, signature, preserve_delete)
+            preserve_delete = bool(allow_delete or (previous is not None and previous[0] > now and len(previous) > 2 and previous[2]))
+            preserve_change = bool(allow_change or (previous is not None and previous[0] > now and len(previous) > 3 and previous[3]))
+            self._internal_paths[path] = (now + 2.0, signature, preserve_delete, preserve_change)
     def _is_internal(self, path, for_delete=False):
         path = os.path.abspath(path)
         now = time.monotonic()
@@ -686,14 +776,16 @@ class MountSyncHandler(FileSystemEventHandler):
             if entry is None:return False
             expiry, expected_signature = entry[0], entry[1]
             allow_delete = bool(entry[2]) if len(entry) > 2 else False
+            allow_change = bool(entry[3]) if len(entry) > 3 else False
             if expiry <= now:
                 del self._internal_paths[path]
                 return False
-            # A deletion event can arrive after the path disappeared or was
-            # recreated, so its signature cannot match the pre-update signature.
             if for_delete and allow_delete:return True
             current_signature = mount_path_signature(path)
             if current_signature == expected_signature:return True
+            if allow_change:
+                self._internal_paths[path] = (expiry, current_signature, allow_delete, False)
+                return True
             del self._internal_paths[path]
             return False
     def _begin_operation(self, folders):
@@ -763,11 +855,14 @@ class MountSyncHandler(FileSystemEventHandler):
             except Exception as e:
                 if attempt==9:raise
                 time.sleep(0.1*(attempt+1))
-    def _copy_file(self, source_path, backend_path):
+    def _copy_file(self, source_path, backend_path, event_time=None):
+        if _consume_ignore_write(source_path,event_time):return
         folder = self._folder_for(backend_path)
         try:self._run_journaled("write",{folder},source_path=os.path.abspath(source_path),backend_path=backend_path,)
         except Exception as exc:print(f"Upload failed: {source_path} -> {backend_path}: {exc}")
     def on_created(self, event):
+        event_time=_event_occurred_at(event)
+        if _consume_ignore_write(event.src_path,event_time):return
         if self._is_internal(event.src_path):return
         if not event.is_directory and is_temporary_file(event.src_path):return
         backend_path = self._get_backend_path(event.src_path)
@@ -776,12 +871,14 @@ class MountSyncHandler(FileSystemEventHandler):
             try:self._run_journaled("mkdir", {backend_path}, backend_path=backend_path, is_directory=True)
             except Exception:pass
             return
-        self._copy_file(event.src_path, backend_path)
+        self._copy_file(event.src_path, backend_path, event_time)
     def on_modified(self, event):
+        event_time=_event_occurred_at(event)
+        if _consume_ignore_write(event.src_path,event_time):return
         if (event.is_directory or is_temporary_file(event.src_path) or self._is_internal(event.src_path)):return
         backend_path = self._get_backend_path(event.src_path)
         if backend_path is None:return
-        self._copy_file(event.src_path, backend_path)
+        self._copy_file(event.src_path, backend_path, event_time)
     def on_deleted(self, event):
         if not event.is_directory and is_temporary_file(event.src_path):return
         if self._is_internal(event.src_path, for_delete=True):return
@@ -795,6 +892,7 @@ class MountSyncHandler(FileSystemEventHandler):
             self._run_journaled("delete", {folder}, backend_path=backend_path, is_directory=event.is_directory)
         except Exception:pass
     def on_moved(self, event):
+        event_time=_event_occurred_at(event)
         if self._is_internal(event.src_path) or self._is_internal(event.dest_path):return
         source_backend = self._get_backend_path(event.src_path)
         destination_backend = self._get_backend_path(event.dest_path)
@@ -803,13 +901,13 @@ class MountSyncHandler(FileSystemEventHandler):
         destination_temp = not event.is_directory and is_temporary_file(event.dest_path)
         if destination_temp:return
         if source_temp and not destination_temp:
-            if os.path.isfile(event.dest_path):self._copy_file(event.dest_path, destination_backend)
+            if os.path.isfile(event.dest_path):self._copy_file(event.dest_path, destination_backend, event_time)
             return
         self.journal.delete_file_hash_state(source_backend)
         source_folder = self._folder_for(source_backend)
         destination_folder = self._folder_for(destination_backend)
         if not self.backing_store.lexists(source_backend):
-            if not event.is_directory and os.path.isfile(event.dest_path):self._copy_file(event.dest_path, destination_backend)
+            if not event.is_directory and os.path.isfile(event.dest_path):self._copy_file(event.dest_path, destination_backend, event_time)
             return
         try:self._run_journaled("move",{source_folder, destination_folder},source_path=source_backend,destination_path=destination_backend,is_directory=event.is_directory,)
         except Exception as exc:print(f"Move failed: {source_backend} -> {destination_backend}: {exc}")
@@ -882,6 +980,7 @@ def main(backing_store, mount_dir):
         event_handler = MountSyncHandler(MOUNT_DIR, backing_store, journal)
         refresh_mount(backing_store, MOUNT_DIR, event_handler.is_folder_busy, journal, event_handler._mark_internal)
         observer = Observer()
+        observer._event_queue = TimestampedEventQueue()
         observer.schedule(event_handler, MOUNT_DIR, recursive=True)
         observer.start()
         def refresh_worker():
@@ -966,9 +1065,8 @@ if __name__ == "__main__":
             shutil.move(source_path, destination_path)
         def get_hash(self, relative_path):
             full_path = self._full_path(relative_path)
-            if not os.path.isfile(full_path):return None
-            hasher = hashlib.sha256()
-            with open(full_path, "rb") as f:
-                for chunk in iter(lambda:f.read(1024 * 1024 * 16), b""):hasher.update(chunk)
-            return hasher.hexdigest()
+            try:st = os.stat(full_path)
+            except FileNotFoundError:return None
+            token = f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}"
+            return hashlib.sha512(token.encode("ascii")).hexdigest()
     main(LocalStorageBackend(".\\storage"), '.\\mount')

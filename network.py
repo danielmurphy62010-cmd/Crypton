@@ -410,6 +410,7 @@ class TCPClient:
                 if not encrypted_prv:raise ProtocolError('Invalid auth_key: missing key data')
             except:pass
             try:
+            # if True:
                 try:self.at_rest_key = _derive_at_rest_key(password, self.salt)
                 except:pass
                 self.sig_prv = Encryption.decryptGCM(encrypted_prv, self.at_rest_key)
@@ -519,6 +520,7 @@ class TCPClient:
                 self.ekey = Encryption.shared_secret(keys2[0], server_ephemeral_pub2)
                 self.sc, self.rc = sc, rc
                 with open('./client keys/auth_key', 'wb') as f:f.write(Encryption.encryptGCM(self.sig_prv, self.at_rest_key))
+                with open('./client keys/salt','wb') as f:f.write(self.salt)
             else:raise ProtocolError('Auth Denied')
         self._backend.auth_finished()
     def send(self, payload, eid=None):
