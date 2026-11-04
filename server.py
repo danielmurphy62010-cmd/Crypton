@@ -1,7 +1,7 @@
 import json, os, shutil, time, network, getpass, sys, traceback, socket, blake3
 import errno, stat, tempfile, threading, uuid
 SHARED_DIR = os.path.expanduser("~/Shared")
-CHUNK_SIZE = 12 * 1024 * 1024
+CHUNK_SIZE = 16 * 1024 * 1024
 IO_CHUNK_SIZE = 16 * 1024 * 1024
 VFS_MISSING_VERSION = "<VFS-MISSING>"
 VFS_UPLOAD_IDLE_TIMEOUT = 3600

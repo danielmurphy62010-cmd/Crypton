@@ -16,23 +16,5 @@
       "name": "backend-compiled",
       "commit_to_repo": true
     }
-  },
-  "winfuse4": {
-    "platforms": ["windows"],
-    "sources": ["winfuse4.cpp"],
-    "build_dependencies": ["setuptools", "wheel", "pybind11"],
-    "cxx_standard": 17,
-    "windows_libraries": ["ole32", "cldapi"],
-    "unix_libraries": [],
-    "compiler_args": {
-      "msvc": ["/W4", "/EHsc"],
-      "unix": []
-    },
-    "artifacts": {
-      "windows_pattern": "winfuse4*.pyd",
-      "linux_pattern": "winfuse4*.so",
-      "name": "winfuse4-compiled",
-      "commit_to_repo": true
-    }
   }
 }

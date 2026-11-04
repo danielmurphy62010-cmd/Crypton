@@ -47,6 +47,7 @@ class TCPServer:
             shutil.rmtree('./server keys',True)
             os.makedirs('./auth keys', exist_ok=True)
             os.makedirs('./server keys', exist_ok=True)
+            self.at_rest_key = _derive_at_rest_key(password, './server keys/SERVER SALT')
         if any([not os.path.exists(x) for x in [self._sig_key,self.admin_totp_path]]):
             try:os.remove(self._sig_key)
             except:pass

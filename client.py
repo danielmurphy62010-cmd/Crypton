@@ -1,7 +1,7 @@
 import json, os, sys, getpass, traceback, time, errno, blake3, Encryption, util
-CHUNK_SIZE = 12 * 1024 * 1024
+CHUNK_SIZE = 16 * 1024 * 1024
 if sys.platform == "win32":
-    import winfuse4 as mount_backend
+    import winfuse3 as mount_backend
     import msvcrt
     PLATFORM = "windows"
 elif sys.platform.startswith("linux"):
