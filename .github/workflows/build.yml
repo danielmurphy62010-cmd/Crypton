@@ -115,6 +115,7 @@ jobs:
         run: |
           python - <<'PY'
           import json
+          import os
           import subprocess
           import sys
           from pathlib import Path
@@ -123,10 +124,29 @@ jobs:
           if not isinstance(config, dict) or not config:
               raise SystemExit("build_config.json must be a non-empty object keyed by module name")
 
+          runner_os = os.environ["RUNNER_OS"]
+          current_platform = "windows" if runner_os == "Windows" else "linux"
+          supported_platforms = {"linux", "windows"}
+
           dependencies = []
           for module_name, module_config in config.items():
               if not isinstance(module_config, dict):
                   raise SystemExit(f"Configuration for {module_name!r} must be an object")
+              platforms = module_config.get("platforms", ["linux", "windows"])
+              if (
+                  not isinstance(platforms, list)
+                  or not platforms
+                  or any(platform not in supported_platforms for platform in platforms)
+              ):
+                  raise SystemExit(
+                      f"{module_name}.platforms must be a non-empty array containing only 'linux' and/or 'windows'"
+                  )
+              if current_platform not in platforms:
+                  print(
+                      f"Skipping dependencies for {module_name}: "
+                      f"not configured for {current_platform}"
+                  )
+                  continue
               module_dependencies = module_config.get("build_dependencies", [])
               if not isinstance(module_dependencies, list) or any(
                   not isinstance(item, str) for item in module_dependencies
@@ -181,7 +201,9 @@ jobs:
               raise SystemExit("Top-level module keys must be unique, ignoring case")
 
           runner_os = os.environ["RUNNER_OS"]
-          pattern_key = "windows_pattern" if runner_os == "Windows" else "linux_pattern"
+          current_platform = "windows" if runner_os == "Windows" else "linux"
+          pattern_key = "windows_pattern" if current_platform == "windows" else "linux_pattern"
+          supported_platforms = {"linux", "windows"}
           runner_temp = Path(os.environ["RUNNER_TEMP"])
           build_root = runner_temp / "native-builds"
           temp_root = runner_temp / "native-build-temp"
@@ -190,9 +212,39 @@ jobs:
                   shutil.rmtree(directory)
               directory.mkdir(parents=True)
 
+          # Ensure each matrix job uploads a non-empty artifact even when every
+          # configured module is restricted to the other operating system.
+          (build_root / "_matrix.json").write_text(
+              json.dumps(
+                  {"os": runner_os, "platform": current_platform, "python": sys.version},
+                  indent=2,
+              ) + "\n",
+              encoding="utf-8",
+          )
+
+          built_modules = []
           for module_key, module_config in config.items():
               if not isinstance(module_config, dict):
                   raise SystemExit(f"Configuration for {module_key!r} must be an object")
+
+              platforms = module_config.get("platforms", ["linux", "windows"])
+              if (
+                  not isinstance(platforms, list)
+                  or not platforms
+                  or any(platform not in supported_platforms for platform in platforms)
+              ):
+                  raise SystemExit(
+                      f"{module_key}.platforms must be a non-empty array containing only 'linux' and/or 'windows'"
+                  )
+              # Skip unsupported modules before invoking setup.py. setup.py
+              # independently enforces the same restriction for direct/manual use.
+              if current_platform not in platforms:
+                  print(
+                      f"\n=== Skipping module: {module_key} "
+                      f"(not configured for {current_platform}) ===",
+                      flush=True,
+                  )
+                  continue
 
               artifacts = module_config.get("artifacts")
               if not isinstance(artifacts, dict):
@@ -224,8 +276,18 @@ jobs:
                   if path.is_file() and fnmatch.fnmatch(path.name, pattern)
               ]
               if not matches:
+                  if current_platform not in platforms:
+                      print(
+                          f"Skipped module {module_key!r} on {current_platform}: "
+                          "setup.py correctly produced no binary for this unsupported platform.",
+                          flush=True,
+                      )
+                      # Do not make the matrix job fail for an intentional platform skip.
+                      continue
                   raise SystemExit(
-                      f"Module {module_key!r} produced no files matching {pattern!r}"
+                      f"Module {module_key!r} is configured for {current_platform} "
+                      f"but produced no files matching {pattern!r}. "
+                      "This indicates a compilation or output-pattern problem."
                   )
 
               flattened = set()
@@ -239,6 +301,8 @@ jobs:
                   destination = module_output / extension.name
                   shutil.copy2(extension, destination)
                   print(f"Built: {destination}")
+
+              built_modules.append(module_key)
 
               module_name = module_config.get("module_name", module_key)
               if not isinstance(module_name, str) or not module_name:
