@@ -351,18 +351,35 @@ public:
     std::optional<FileHashState> get_file_hash_state(const std::string& backend_path) {
         py::gil_scoped_acquire gil;
         std::lock_guard<std::recursive_mutex> lock(mutex_);
-        py::object row = db_.attr("execute")(
-            "SELECT hash, local_hash, last_check, cooldown, next_check, backing_mtime, unchanged_checks FROM file_hashes WHERE backend_path = ?",
-            py::make_tuple(normalize_backend_path(backend_path))).attr("fetchone")();
-        if (row.is_none()) return std::nullopt;
+    
+        py::object row_object = db_.attr("execute")(
+            "SELECT hash, local_hash, last_check, cooldown, "
+            "next_check, backing_mtime, unchanged_checks "
+            "FROM file_hashes WHERE backend_path = ?",
+            py::make_tuple(normalize_backend_path(backend_path))
+        ).attr("fetchone")();
+    
+        if (row_object.is_none())
+            return std::nullopt;
+    
+        // Convert the SQLite result into a Python sequence before
+        // performing integer indexing.
+        py::sequence row =
+            py::reinterpret_borrow<py::sequence>(row_object);
+    
         FileHashState state;
+    
         state.hash = optional_string(row[0]);
         state.local_hash = optional_string(row[1]);
         state.last_check = optional_double(row[2]);
         state.cooldown = optional_double(row[3]);
         state.next_check = optional_double(row[4]);
         state.backing_mtime = optional_double(row[5]);
-        state.unchanged_checks = row[6].is_none() ? 0 : py::cast<int>(row[6]);
+    
+        state.unchanged_checks = row[6].is_none()
+            ? 0
+            : py::cast<int>(row[6]);
+    
         return state;
     }
     void set_file_hash_state(const std::string& backend_path,
