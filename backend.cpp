@@ -14,7 +14,6 @@
 #include <functional>
 #include <iostream>
 #include <map>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -24,7 +23,6 @@
 #include <string>
 #include <thread>
 #include <utility>
-#include <unordered_map>
 #include <vector>
 #ifdef _WIN32
 #  define NOMINMAX
@@ -46,7 +44,6 @@ using pollfd_t = WSAPOLLFD;
 #  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/types.h>
-#  include <sys/uio.h>
 #  include <unistd.h>
 #  ifdef __linux__
 #    include <sys/random.h>
@@ -60,37 +57,32 @@ namespace py = pybind11;
 namespace {
 constexpr size_t MAGIC_N = 8;
 constexpr size_t EID_N = 8;
-constexpr size_t COUNTER_N = 8;
-constexpr size_t CHANNEL_COUNT = 5;
-constexpr size_t ASSOCIATION_TOKEN_N = 32;
-constexpr size_t QUEUE_LIMIT = 8;
-constexpr size_t RECV_QUEUE_LIMIT = 16;
+constexpr size_t QUEUE_LIMIT = 16;
 constexpr size_t MAX_UNAUTH = 65535;
-constexpr size_t MAX_AUTH = 32UL * 1024 * 1024;
-constexpr size_t UNAUTH_HEAD = 5; // 4-byte length + type byte
-constexpr size_t AUTH_HEAD = 5;   // 4-byte length + type byte
-constexpr size_t MAX_INPUT_BUFFER = MAX_AUTH + 64UL * 1024;
+constexpr size_t MAX_AUTH = 33554432;
+constexpr size_t UNAUTH_HEAD = 2;
+constexpr size_t AUTH_HEAD = 5;
+constexpr size_t MAX_INPUT_BUFFER = 32UL * 1024 * 1024;
 constexpr size_t MAX_CONNECTIONS = 200;
 constexpr size_t MAX_UNAUTH_CONNECTIONS = 128;
 constexpr size_t MAX_CONNECTIONS_PER_PEER = 64;
 constexpr size_t MAX_PEER_BUCKETS = 4096;
 constexpr size_t MAX_NEW_CONNECTIONS_PER_PEER_PER_MINUTE = 120;
-constexpr size_t MAX_READ_PER_TICK = 4UL * 1024 * 1024; // 4 MiB per drain pass
-
-constexpr size_t MAX_WRITE_PER_TICK = 1024UL * 1024; // 1 MiB per send call
-
+constexpr size_t MAX_ACTIVE_EIDS_PER_CONNECTION = 2048;
+constexpr size_t MAX_READ_PER_TICK = 64 * 1024;
+constexpr size_t MAX_WRITE_PER_TICK = 64 * 1024;
 constexpr size_t MAX_ACCEPT_PER_TICK = 32;
 constexpr size_t MAX_PARSE_FRAMES_PER_CALL = 32;
 constexpr size_t MAX_PARSE_STEPS_PER_CALL = 128;
-constexpr size_t MAX_GLOBAL_BUFFERED_BYTES = 256UL * 1024 * 1024;
-constexpr size_t MAX_CONNECTION_BUFFERED_BYTES = 256UL * 1024 * 1024;
+constexpr size_t MAX_GLOBAL_BUFFERED_BYTES = 512UL * 1024 * 1024;
+constexpr size_t MAX_CONNECTION_BUFFERED_BYTES = 128UL * 1024 * 1024;
 constexpr size_t MAX_POOL_WORKERS = 64;
 constexpr size_t MAX_PENDING_CALLBACKS_MIN = 32;
 constexpr size_t MAX_PENDING_CALLBACKS_MAX = 1024;
 constexpr size_t MAX_CID_BYTES = 256;
 constexpr auto UNAUTH_TIMEOUT = std::chrono::seconds(30);
+constexpr auto EID_TTL = std::chrono::minutes(1);
 constexpr auto CLEANUP_INTERVAL = std::chrono::seconds(1);
-constexpr auto EID_ACTIVITY_TTL = std::chrono::seconds(60);
 constexpr auto IO_POLL_INTERVAL_MS = 20;
 constexpr auto CONNECT_TIMEOUT = std::chrono::seconds(5);
 constexpr auto GREETING_TIMEOUT = std::chrono::seconds(5);
@@ -152,15 +144,18 @@ void nonblocking(socket_t s) {
 #endif
 }
 void tune_socket(socket_t s) {
+    int buffer_size = 64 * 1024;
     int one = 1;
-    // Do not pin SO_SNDBUF/SO_RCVBUF to a small fixed value here.  Explicit
-    // socket buffer sizes disable or constrain TCP autotuning on common OSes,
-    // which can severely cap throughput on high-bandwidth/high-latency links.
-    // Leave the OS defaults/autotuning in place and only tune latency/control.
 #ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&buffer_size), sizeof(buffer_size));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&buffer_size), sizeof(buffer_size));
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char*>(&one), sizeof(one));
 #else
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 #  ifdef SO_NOSIGPIPE
@@ -225,44 +220,6 @@ bool connect_with_deadline(socket_t s, const sockaddr* addr, socket_len_t addrle
         return false;
 #endif
     return so_error == 0;
-}
-bool send_exact_deadline(socket_t s, const uint8_t* data, size_t size,
-                         std::chrono::steady_clock::time_point deadline) {
-    size_t sent_total = 0;
-    while (sent_total < size) {
-        if (!wait_socket(s, POLLOUT, deadline)) return false;
-#ifdef _WIN32
-        const int sent = ::send(s, reinterpret_cast<const char*>(data + sent_total),
-                                static_cast<int>(size - sent_total), 0);
-#else
-#  ifdef MSG_NOSIGNAL
-        const ssize_t sent = ::send(s, data + sent_total, size - sent_total, MSG_NOSIGNAL);
-#  else
-        const ssize_t sent = ::send(s, data + sent_total, size - sent_total, 0);
-#  endif
-#endif
-        if (sent > 0) sent_total += static_cast<size_t>(sent);
-        else if (sent < 0 && would_block(sockerr())) continue;
-        else return false;
-    }
-    return true;
-}
-bool recv_exact_deadline(socket_t s, uint8_t* data, size_t size,
-                         std::chrono::steady_clock::time_point deadline) {
-    size_t received = 0;
-    while (received < size) {
-        if (!wait_socket(s, POLLIN, deadline)) return false;
-#ifdef _WIN32
-        const int got = ::recv(s, reinterpret_cast<char*>(data + received),
-                               static_cast<int>(size - received), 0);
-#else
-        const ssize_t got = ::recv(s, data + received, size - received, 0);
-#endif
-        if (got > 0) received += static_cast<size_t>(got);
-        else if (got < 0 && would_block(sockerr())) continue;
-        else return false;
-    }
-    return true;
 }
 void random_fill(uint8_t* p, size_t n) {
 #ifdef _WIN32
@@ -373,11 +330,6 @@ public:
     void release(size_t n) {
         if (n) used_.fetch_sub(n, std::memory_order_acq_rel);
     }
-    size_t used() const { return used_.load(std::memory_order_acquire); }
-    size_t available() const {
-        const size_t current = used();
-        return current >= limit_ ? 0 : limit_ - current;
-    }
 private:
     const size_t limit_;
     std::atomic<size_t> used_{0};
@@ -415,37 +367,23 @@ private:
     size_t bytes_;
 };
 struct Message {
-    uint64_t counter = 0;
     std::string eid;
     std::string payload;
     bool authed = false;
     std::shared_ptr<Lease> memory;
 };
 struct Pending {
-    uint64_t counter = 0;
     std::string payload;
     std::string eid;
     bool authed = false;
     std::shared_ptr<Lease> memory;
-    bool ack = false;
 };
 struct Conn {
-    // A root Conn is the logical session (and channel 0). Auxiliary Conn
-    // objects are physical channels sharing the root's queues and quotas.
     socket_t sock = BAD_SOCKET;
-    std::weak_ptr<Conn> parent;
-    int channel_index = 0;
-    bool wire_is_control = false;
-    std::mutex send_lock;
-    std::mutex recv_lock;
-    std::thread send_thread;
-    std::thread recv_thread;
     bool server_side = false;
     std::atomic<bool> authed{false};
     std::atomic<bool> closed{false};
     std::atomic<bool> backpressure{false};
-    std::atomic<bool> memory_backpressure{false};
-    std::atomic<size_t> blocked_memory_need{0};
     std::atomic<bool> handshake_started{false};
     std::atomic<bool> disconnect_notified{false};
     std::string temp_cid;
@@ -453,74 +391,24 @@ struct Conn {
     std::string magic1;
     std::string magic2;
     std::string peer;
-    std::string association_token; // root only; sent only on the base connection
-    std::array<std::shared_ptr<Conn>, CHANNEL_COUNT> channels{}; // root owns channels 1..4
-    std::array<bool, CHANNEL_COUNT> channel_busy{};             // guarded by root->mutex
-    std::array<double, CHANNEL_COUNT> tx_load{};                // outbound-only EWMA score
-    std::array<std::chrono::steady_clock::time_point, CHANNEL_COUNT> tx_load_updated{};
-    size_t tx_rr_cursor = 0;
-    uint64_t next_send_counter = 1;
-    uint64_t peer_ack_counter = 0;
-    uint64_t recv_contiguous_counter = 0;
-    std::deque<uint64_t> ack_queue;
-    uint8_t recv_counter_window_bits = 0; // bit 0 is contiguous+1, bit 4 is contiguous+5
-    // Callback-coalescing state only; this is not replay protection. An EID
-    // remains active while messages arrive less than 60 seconds apart.
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> eid_activity;
-    std::chrono::steady_clock::time_point last_eid_cleanup = std::chrono::steady_clock::now();
-    std::set<std::string> deferred_exchange_callbacks; // first notification held until local auth completes
     std::chrono::steady_clock::time_point connect_time = std::chrono::steady_clock::now();
     uint64_t connection_id = 0;
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<Message> recvq;
     std::deque<Pending> sendq;
+    std::map<std::string, std::chrono::steady_clock::time_point> eid_activity;
+    std::chrono::steady_clock::time_point last_cleanup = std::chrono::steady_clock::now();
     std::vector<uint8_t> input;
     std::shared_ptr<Lease> input_memory;
     std::shared_ptr<Lease> input_extra_memory;
-    // Large frames are transmitted as prefix + payload + suffix.  Keeping
-    // the payload separate avoids an extra allocation and full-size memcpy.
     std::vector<uint8_t> wire;
-    std::string wire_payload;
-    std::array<uint8_t, MAGIC_N> wire_suffix{};
-    size_t wire_suffix_size = 0;
     size_t wire_off = 0;
     std::shared_ptr<Lease> wire_memory;
     std::shared_ptr<Quota> global_memory;
     std::shared_ptr<Quota> local_memory = std::make_shared<Quota>(MAX_CONNECTION_BUFFERED_BYTES);
     explicit Conn(std::shared_ptr<Quota> global) : global_memory(std::move(global)) {}
 };
-std::shared_ptr<Conn> logical_session(const std::shared_ptr<Conn>& channel) {
-    if (!channel) return {};
-    auto parent = channel->parent.lock();
-    return parent ? parent : channel;
-}
-// Must be called with conn.mutex held. Cleanup is amortized to once per
-// second and is performed by the base receive loop, not on every message.
-void cleanup_eid_activity_locked(Conn& conn,
-                                std::chrono::steady_clock::time_point now,
-                                bool force = false) {
-    if (!force && now - conn.last_eid_cleanup < CLEANUP_INTERVAL) return;
-    conn.last_eid_cleanup = now;
-    for (auto it = conn.eid_activity.begin(); it != conn.eid_activity.end();) {
-        if (now - it->second >= EID_ACTIVITY_TTL) {
-            conn.deferred_exchange_callbacks.erase(it->first);
-            it = conn.eid_activity.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-void cleanup_eid_activity(const std::shared_ptr<Conn>& conn) {
-    if (!conn) return;
-    const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(conn->mutex);
-    cleanup_eid_activity_locked(*conn, now);
-}
-std::shared_ptr<Conn> channel_at(const std::shared_ptr<Conn>& root, size_t index) {
-    if (!root || index >= CHANNEL_COUNT) return {};
-    return index == 0 ? root : root->channels[index];
-}
 void log_callback_error(const char* where, const char* what) {
     static std::mutex log_mutex;
     static auto last_log = std::chrono::steady_clock::time_point::min();
@@ -621,120 +509,40 @@ private:
     std::mutex workers_mutex_;
     std::vector<std::thread> workers_;
 };
-void put_u64(uint8_t* p, uint64_t value) {
-    for (int i = 7; i >= 0; --i) {
-        p[i] = static_cast<uint8_t>(value & 0xff);
-        value >>= 8;
-    }
-}
-uint64_t u64(const uint8_t* p) {
-    uint64_t value = 0;
-    for (size_t i = 0; i < 8; ++i) value = (value << 8) | p[i];
-    return value;
-}
-std::string generate_eid() {
-    // EIDs are correlation labels, not secrets or replay tokens. Seed one
-    // process-wide counter once, then allocate IDs with a single relaxed atomic
-    // increment instead of calling the OS CSPRNG for every small message.
-    static std::atomic<uint64_t> next{[] {
-        const std::string seed = random_bytes(EID_N);
-        uint64_t value = u64(reinterpret_cast<const uint8_t*>(seed.data()));
-        value &= 0x7fffffffffffffffULL;
-        return value == 0 ? uint64_t{1} : value;
-    }()};
-    const uint64_t value = next.fetch_add(1, std::memory_order_relaxed);
-    if (value == 0 || value == UINT64_MAX)
-        throw std::runtime_error("generated EID counter exhausted");
-    std::string out(EID_N, '\0');
-    put_u64(reinterpret_cast<uint8_t*>(out.data()), value);
-    return out;
-}
-void make_frame_prefix(const Conn& session, const Pending& p,
-                       std::vector<uint8_t>& out) {
+std::vector<uint8_t> make_frame(const Conn& c, const Pending& p) {
     const size_t payload_size = p.payload.size();
     if (!p.authed && payload_size > MAX_UNAUTH)
         throw std::length_error("handshake payload exceeds 65535 bytes");
     if (p.authed && payload_size > MAX_AUTH)
-        throw std::length_error("payload exceeds 32 MiB length limit");
-    const size_t header_size = p.authed ? AUTH_HEAD + EID_N + COUNTER_N
-                                        : UNAUTH_HEAD + COUNTER_N;
-    out.clear();
-    out.reserve(MAGIC_N + header_size);
-    out.insert(out.end(), session.magic1.begin(), session.magic1.end());
-    out.push_back(static_cast<uint8_t>(payload_size >> 24));
-    out.push_back(static_cast<uint8_t>((payload_size >> 16) & 0xff));
-    out.push_back(static_cast<uint8_t>((payload_size >> 8) & 0xff));
-    out.push_back(static_cast<uint8_t>(payload_size & 0xff));
-    out.push_back(static_cast<uint8_t>(p.ack ? 'K' : (p.authed ? 'A' : 'H')));
-    if (p.authed) out.insert(out.end(), p.eid.begin(), p.eid.end());
-    const size_t counter_at = out.size();
-    out.resize(counter_at + COUNTER_N);
-    put_u64(out.data() + counter_at, p.counter);
-}
-size_t wire_total_size(const Conn& channel) {
-    return channel.wire.size() + channel.wire_payload.size() + channel.wire_suffix_size;
-}
-std::ptrdiff_t send_wire_parts(socket_t sock, const Conn& channel, size_t max_bytes) {
-    struct Segment { const uint8_t* data; size_t size; };
-    Segment segments[3]{};
-    size_t count = 0;
-    size_t skip = channel.wire_off;
-    size_t budget = max_bytes;
-    auto add_segment = [&](const uint8_t* data, size_t size) {
-        if (skip >= size) {
-            skip -= size;
-            return;
-        }
-        data += skip;
-        size -= skip;
-        skip = 0;
-        size = std::min(size, budget);
-        if (size) {
-            segments[count++] = {data, size};
-            budget -= size;
-        }
-    };
-    add_segment(channel.wire.data(), channel.wire.size());
-    add_segment(reinterpret_cast<const uint8_t*>(channel.wire_payload.data()),
-                channel.wire_payload.size());
-    add_segment(channel.wire_suffix.data(), channel.wire_suffix_size);
-    if (!count) return 0;
-#ifdef _WIN32
-    WSABUF buffers[3]{};
-    for (size_t i = 0; i < count; ++i) {
-        buffers[i].buf = reinterpret_cast<char*>(const_cast<uint8_t*>(segments[i].data));
-        buffers[i].len = static_cast<ULONG>(segments[i].size);
+        throw std::length_error("payload exceeds 25-bit length limit");
+    const size_t header_size = p.authed ? AUTH_HEAD + EID_N : UNAUTH_HEAD;
+    const size_t total_size = MAGIC_N + header_size + payload_size + MAGIC_N;
+    std::vector<uint8_t> out(total_size);
+    uint8_t* ptr = out.data();
+    std::memcpy(ptr, c.magic1.data(), MAGIC_N);
+    ptr += MAGIC_N;
+    if (!p.authed) {
+        ptr[0] = static_cast<uint8_t>(payload_size >> 8);
+        ptr[1] = static_cast<uint8_t>(payload_size & 0xff);
+        ptr += UNAUTH_HEAD;
+    } else {
+        ptr[0] = static_cast<uint8_t>(payload_size >> 24);
+        ptr[1] = static_cast<uint8_t>((payload_size >> 16) & 0xff);
+        ptr[2] = static_cast<uint8_t>((payload_size >> 8) & 0xff);
+        ptr[3] = static_cast<uint8_t>(payload_size & 0xff);
+        ptr[4] = '0';
+        std::memcpy(ptr + AUTH_HEAD, p.eid.data(), EID_N);
+        ptr += AUTH_HEAD + EID_N;
     }
-    DWORD sent = 0;
-    const int rc = WSASend(sock, buffers, static_cast<DWORD>(count), &sent, 0, nullptr, nullptr);
-    if (rc == SOCKET_ERROR) return -1;
-    return static_cast<std::ptrdiff_t>(sent);
-#else
-    struct iovec vectors[3]{};
-    for (size_t i = 0; i < count; ++i) {
-        vectors[i].iov_base = const_cast<uint8_t*>(segments[i].data);
-        vectors[i].iov_len = segments[i].size;
-    }
-    struct msghdr message{};
-    message.msg_iov = vectors;
-    message.msg_iovlen = count;
-#  ifdef MSG_NOSIGNAL
-    return static_cast<std::ptrdiff_t>(::sendmsg(sock, &message, MSG_NOSIGNAL));
-#  else
-    return static_cast<std::ptrdiff_t>(::sendmsg(sock, &message, 0));
-#  endif
-#endif
+    if (payload_size) std::memcpy(ptr, p.payload.data(), payload_size);
+    ptr += payload_size;
+    std::memcpy(ptr, c.magic2.data(), MAGIC_N);
+    return out;
 }
-
-bool has_recv_room(const std::shared_ptr<Conn>& channel) {
-    auto session = logical_session(channel);
-    if (!session) return false;
-    std::lock_guard<std::mutex> lock(session->mutex);
-    return !session->closed &&
-           session->recvq.size() < RECV_QUEUE_LIMIT &&
-           session->local_memory->used() < MAX_CONNECTION_BUFFERED_BYTES;
+bool has_recv_room(const std::shared_ptr<Conn>& c) {
+    std::lock_guard<std::mutex> lock(c->mutex);
+    return !c->closed && c->recvq.size() < QUEUE_LIMIT;
 }
-
 bool reallocate_input(Conn& c, size_t target_capacity) {
     if (target_capacity > MAX_INPUT_BUFFER) return false;
     if (target_capacity < c.input.size()) target_capacity = c.input.size();
@@ -775,8 +583,7 @@ bool ensure_input_capacity(Conn& c, size_t required) {
         if (next <= target) return false;
         target = next;
     }
-    if (reallocate_input(c, target)) return true;
-    return target != required && reallocate_input(c, required);
+    return reallocate_input(c, target);
 }
 void compact_input(Conn& c, size_t consumed) {
     if (consumed) {
@@ -795,76 +602,44 @@ void compact_input(Conn& c, size_t consumed) {
         if (target < c.input.capacity()) reallocate_input(c, target);
     }
 }
-void clear_conn_io_state(const std::shared_ptr<Conn>& input) {
-    auto root = logical_session(input);
-    if (!root) return;
-    root->closed = true;
-    root->cv.notify_all();
-    std::array<std::shared_ptr<Conn>, CHANNEL_COUNT> channels{};
-    channels[0] = root;
-    for (size_t i = 1; i < CHANNEL_COUNT; ++i) channels[i] = root->channels[i];
-    // Close every socket before joining so blocked poll/send/recv calls wake.
-    for (auto& channel : channels) {
-        if (!channel) continue;
-        channel->closed = true;
-        // Keep the handle value stable until both channel workers have joined;
-        // this avoids racing their poll/send/recv calls against a BAD_SOCKET write.
-        if (channel->sock != BAD_SOCKET) close_sock(channel->sock);
+enum class EidResult { Fresh, Existing, Limit, Closed };
+EidResult touch_eid(const std::shared_ptr<Conn>& c, const std::string& eid) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(c->mutex);
+    if (c->closed) return EidResult::Closed;
+    auto found = c->eid_activity.find(eid);
+    if (found != c->eid_activity.end()) {
+        found->second = now;
+        return EidResult::Existing;
     }
-    for (auto& channel : channels) {
-        if (!channel) continue;
-        const auto self = std::this_thread::get_id();
-        if (channel->send_thread.joinable()) {
-            if (channel->send_thread.get_id() == self) channel->send_thread.detach();
-            else channel->send_thread.join();
-        }
-        if (channel->recv_thread.joinable()) {
-            if (channel->recv_thread.get_id() == self) channel->recv_thread.detach();
-            else channel->recv_thread.join();
-        }
-        channel->sock = BAD_SOCKET;
-        std::vector<uint8_t>().swap(channel->wire);
-        std::string().swap(channel->wire_payload);
-        channel->wire_suffix_size = 0;
-        channel->wire_off = 0;
-        channel->wire_memory.reset();
-        std::vector<uint8_t>().swap(channel->input);
-        channel->input_memory.reset();
-        channel->input_extra_memory.reset();
+    for (auto it = c->eid_activity.begin(); it != c->eid_activity.end();) {
+        if (now - it->second >= EID_TTL) it = c->eid_activity.erase(it);
+        else ++it;
+    }
+    if (c->eid_activity.size() >= MAX_ACTIVE_EIDS_PER_CONNECTION)
+        return EidResult::Limit;
+    c->eid_activity.emplace(eid, now);
+    return EidResult::Fresh;
+}
+void clear_conn_io_state(const std::shared_ptr<Conn>& c) {
+    c->closed = true;
+    if (c->sock != BAD_SOCKET) {
+        close_sock(c->sock);
+        c->sock = BAD_SOCKET;
     }
     {
-        std::lock_guard<std::mutex> lock(root->mutex);
-        root->recvq.clear();
-        root->sendq.clear();
-        root->eid_activity.clear();
-        root->last_eid_cleanup = std::chrono::steady_clock::now();
-        root->recv_counter_window_bits = 0;
-        root->ack_queue.clear();
-        root->deferred_exchange_callbacks.clear();
-        root->peer_ack_counter = 0;
-        root->recv_contiguous_counter = 0;
-        for (size_t i = 0; i < CHANNEL_COUNT; ++i) root->channel_busy[i] = false;
+        std::lock_guard<std::mutex> lock(c->mutex);
+        c->recvq.clear();
+        c->sendq.clear();
+        c->eid_activity.clear();
     }
-    root->channels.fill({});
-    root->cv.notify_all();
-}
-
-void acknowledge_send_counter(const std::shared_ptr<Conn>& root, uint64_t counter) {
-    if (!root || counter == 0) return;
-    {
-        std::lock_guard<std::mutex> lock(root->mutex);
-        // Ignore unsolicited/future acknowledgements and stale duplicates.
-        if (counter > root->peer_ack_counter && counter < root->next_send_counter)
-            root->peer_ack_counter = counter;
-    }
-    root->cv.notify_all();
-}
-void queue_ack_locked(Conn& root, uint64_t counter) {
-    if (counter == 0) return;
-    // Cumulative ACKs supersede older ones; coalesce unsent acknowledgements.
-    if (root.ack_queue.empty()) root.ack_queue.push_back(counter);
-    else root.ack_queue.back() = std::max(root.ack_queue.back(), counter);
-    root.cv.notify_all();
+    std::vector<uint8_t>().swap(c->wire);
+    c->wire_off = 0;
+    c->wire_memory.reset();
+    std::vector<uint8_t>().swap(c->input);
+    c->input_memory.reset();
+    c->input_extra_memory.reset();
+    c->cv.notify_all();
 }
 bool resync_after_malformed(Conn& c, size_t& off) {
     const auto next = find_bytes(c.input, c.magic1, off + 1);
@@ -909,45 +684,23 @@ bool parse_buffered(const std::shared_ptr<Conn>& conn, Deliver deliver) {
             off = *start;
             progressed = true;
         }
-        auto session = logical_session(conn);
-        const size_t common_header_size = MAGIC_N + UNAUTH_HEAD;
-        if (c.input.size() - off < common_header_size) break;
-        const uint8_t* base = c.input.data() + off;
-        const uint8_t frame_type = base[MAGIC_N + 4];
-        const bool authed = frame_type == 'A';
-        const bool handshake = frame_type == 'H';
-        const bool is_ack = frame_type == 'K';
-        if (!authed && !handshake && !is_ack) {
-            progressed = true;
-            if (!resync_after_malformed(c, off)) break;
-            continue;
-        }
-        if (handshake && c.channel_index != 0) {
-            session->closed = true;
-            session->cv.notify_all();
-            c.closed = true;
-            return progressed;
-        }
-        const size_t header_size = authed ? AUTH_HEAD + EID_N + COUNTER_N
-                                           : UNAUTH_HEAD + COUNTER_N;
+        const bool authed = c.authed.load(std::memory_order_acquire);
+        const size_t header_size = authed ? AUTH_HEAD + EID_N : UNAUTH_HEAD;
         const size_t body_size = MAGIC_N + header_size;
         if (c.input.size() - off < body_size) break;
-        const uint32_t payload_size = u32(base + MAGIC_N);
+        const uint8_t* base = c.input.data() + off;
+        const uint32_t payload_size = authed ? u32(base + MAGIC_N) : u16(base + MAGIC_N);
         std::string eid;
-        uint64_t counter = 0;
         if (authed) {
+            const uint8_t flag = base[MAGIC_N + 4];
+            if (flag != '0' && flag != '1') {
+                progressed = true;
+                if (!resync_after_malformed(c, off)) break;
+                continue;
+            }
             eid.assign(reinterpret_cast<const char*>(base + MAGIC_N + AUTH_HEAD), EID_N);
-            counter = u64(base + MAGIC_N + AUTH_HEAD + EID_N);
-        } else {
-            counter = u64(base + MAGIC_N + UNAUTH_HEAD);
         }
-        if ((authed && counter == 0) || (handshake && counter != 0) ||
-            (is_ack && (counter == 0 || payload_size != 0))) {
-            progressed = true;
-            if (!resync_after_malformed(c, off)) break;
-            continue;
-        }
-        if (!authed && !is_ack && payload_size > MAX_UNAUTH) {
+        if (payload_size > (authed ? MAX_AUTH : MAX_UNAUTH)) {
             progressed = true;
             if (!resync_after_malformed(c, off)) break;
             continue;
@@ -966,25 +719,13 @@ bool parse_buffered(const std::shared_ptr<Conn>& conn, Deliver deliver) {
             progressed = true;
             continue;
         }
-        if (is_ack) {
-            acknowledge_send_counter(session, counter);
+        auto memory = Lease::make(c.global_memory, c.local_memory,
+                                  static_cast<size_t>(payload_size) + sizeof(Message) + 32);
+        if (!memory) {
             off += total_size;
             ++frames;
             progressed = true;
             continue;
-        }
-        if (authed && payload_size > MAX_AUTH) {
-            progressed = true;
-            if (!resync_after_malformed(c, off)) break;
-            continue;
-        }
-        auto memory = Lease::make(c.global_memory, c.local_memory,
-                                  static_cast<size_t>(payload_size) + sizeof(Message) + 32);
-        if (!memory) {
-            c.memory_backpressure = true;
-            c.blocked_memory_need = static_cast<size_t>(payload_size) + sizeof(Message) + 32;
-            compact_input(c, off);
-            return progressed;
         }
         std::string payload;
         try {
@@ -996,7 +737,7 @@ bool parse_buffered(const std::shared_ptr<Conn>& conn, Deliver deliver) {
             progressed = true;
             continue;
         }
-        if (!deliver(authed, eid, counter, std::move(payload), std::move(memory))) {
+        if (!deliver(authed, eid, std::move(payload), std::move(memory))) {
             compact_input(c, off);
             return progressed;
         }
@@ -1006,166 +747,6 @@ bool parse_buffered(const std::shared_ptr<Conn>& conn, Deliver deliver) {
     }
     compact_input(c, off);
     return progressed;
-}
-
-// A frame is assigned to the least-loaded available outbound channel.  Load
-// is endpoint-local and only updated by bytes this endpoint sends; inbound
-// traffic can therefore never distort this endpoint's transmit weights.
-bool claim_pending_for_channel(const std::shared_ptr<Conn>& root,
-                               size_t channel_index, Pending& pending) {
-    if (!root || channel_index >= CHANNEL_COUNT) return false;
-    std::lock_guard<std::mutex> lock(root->mutex);
-    if (root->closed) return false;
-    if (!root->ack_queue.empty()) {
-        pending.counter = root->ack_queue.front();
-        root->ack_queue.pop_front();
-        pending.ack = true;
-        return true;
-    }
-    if (root->sendq.empty()) return false;
-    const bool handshake = !root->sendq.front().authed;
-    if (handshake && channel_index != 0) return false;
-    if (!handshake &&
-        (root->next_send_counter <= root->peer_ack_counter ||
-         root->next_send_counter - root->peer_ack_counter > 5))
-        return false;
-    const auto now = std::chrono::steady_clock::now();
-    size_t best = CHANNEL_COUNT;
-    double best_score = std::numeric_limits<double>::infinity();
-    for (size_t i = 0; i < CHANNEL_COUNT; ++i) {
-        auto channel = channel_at(root, i);
-        if (!channel || channel->closed || channel->sock == BAD_SOCKET || root->channel_busy[i])
-            continue;
-        if (i != 0 && !root->authed.load(std::memory_order_acquire)) continue;
-        if (handshake && i != 0) continue;
-        auto& updated = root->tx_load_updated[i];
-        if (updated == std::chrono::steady_clock::time_point{}) updated = now;
-        else {
-            const double elapsed = std::chrono::duration<double>(now - updated).count();
-            // Half-life is approximately 350 ms: recent bursts influence the
-            // next few choices, then old activity gradually loses its weight.
-            root->tx_load[i] *= std::exp(-elapsed / 0.505);
-            updated = now;
-        }
-        const size_t tie_distance = (i + CHANNEL_COUNT - root->tx_rr_cursor) % CHANNEL_COUNT;
-        const double score = root->tx_load[i] + static_cast<double>(tie_distance) * 1e-9;
-        if (score < best_score) {
-            best_score = score;
-            best = i;
-        }
-    }
-    if (best != channel_index || best == CHANNEL_COUNT) return false;
-    pending = std::move(root->sendq.front());
-    root->sendq.pop_front();
-    // Base-port handshake frames stay ordered on channel zero and use counter 0.
-    if (pending.authed) {
-        if (root->next_send_counter == 0 || root->next_send_counter == UINT64_MAX) {
-            root->closed = true;
-            root->cv.notify_all();
-            return false;
-        }
-        pending.counter = root->next_send_counter++;
-        root->channel_busy[channel_index] = true;
-    } else {
-        pending.counter = 0;
-    }
-    root->tx_rr_cursor = (channel_index + 1) % CHANNEL_COUNT;
-    return true;
-}
-void update_channel_tx_load(const std::shared_ptr<Conn>& root,
-                            size_t channel_index, size_t bytes) {
-    if (!root || channel_index >= CHANNEL_COUNT || bytes == 0) return;
-    const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(root->mutex);
-    auto& updated = root->tx_load_updated[channel_index];
-    if (updated != std::chrono::steady_clock::time_point{}) {
-        const double elapsed = std::chrono::duration<double>(now - updated).count();
-        root->tx_load[channel_index] *= std::exp(-elapsed / 0.505);
-    }
-    root->tx_load[channel_index] += static_cast<double>(bytes);
-    updated = now;
-}
-void release_channel_slot(const std::shared_ptr<Conn>& root, size_t channel_index) {
-    if (!root || channel_index >= CHANNEL_COUNT) return;
-    {
-        std::lock_guard<std::mutex> lock(root->mutex);
-        root->channel_busy[channel_index] = false;
-    }
-    root->cv.notify_all();
-}
-void mark_session_closed(const std::shared_ptr<Conn>& channel) {
-    auto root = logical_session(channel);
-    if (!root) return;
-    if (channel) channel->closed = true;
-    root->closed = true;
-    root->cv.notify_all();
-}
-void write_channel_ready(const std::shared_ptr<Conn>& root,
-                         const std::shared_ptr<Conn>& channel) {
-    if (!root || !channel || root->closed || channel->closed || channel->sock == BAD_SOCKET)
-        return;
-    if (channel->wire_off >= wire_total_size(*channel)) {
-        std::vector<uint8_t>().swap(channel->wire);
-        std::string().swap(channel->wire_payload);
-        channel->wire_suffix_size = 0;
-        channel->wire_off = 0;
-        channel->wire_memory.reset();
-        if (!channel->wire_is_control)
-            release_channel_slot(root, static_cast<size_t>(channel->channel_index));
-        channel->wire_is_control = false;
-
-        Pending pending;
-        if (!claim_pending_for_channel(root, static_cast<size_t>(channel->channel_index), pending))
-            return;
-        const size_t header_size = pending.authed
-            ? AUTH_HEAD + EID_N + COUNTER_N : UNAUTH_HEAD + COUNTER_N;
-        const size_t frame_size = MAGIC_N + header_size + pending.payload.size() + MAGIC_N;
-        // Move the payload's existing reservation to the wire frame.  Previously
-        // building a contiguous frame allocated and copied the full payload again.
-        channel->wire_memory = std::move(pending.memory);
-        if (!channel->wire_memory)
-            channel->wire_memory = Lease::make(root->global_memory, root->local_memory, frame_size);
-        if (!channel->wire_memory) {
-            release_channel_slot(root, static_cast<size_t>(channel->channel_index));
-            mark_session_closed(channel);
-            return;
-        }
-        try {
-            make_frame_prefix(*root, pending, channel->wire);
-            channel->wire_payload = std::move(pending.payload);
-            std::memcpy(channel->wire_suffix.data(), root->magic2.data(), MAGIC_N);
-            channel->wire_suffix_size = MAGIC_N;
-            channel->wire_is_control = pending.ack || !pending.authed;
-        } catch (...) {
-            release_channel_slot(root, static_cast<size_t>(channel->channel_index));
-            mark_session_closed(channel);
-            return;
-        }
-    }
-
-    const size_t total_size = wire_total_size(*channel);
-    if (channel->wire_off >= total_size) return;
-    const std::ptrdiff_t sent = send_wire_parts(channel->sock, *channel, MAX_WRITE_PER_TICK);
-    if (sent > 0) {
-        if (!channel->wire_is_control)
-            update_channel_tx_load(root, static_cast<size_t>(channel->channel_index),
-                                   static_cast<size_t>(sent));
-        channel->wire_off += static_cast<size_t>(sent);
-        if (channel->wire_off == wire_total_size(*channel)) {
-            const bool control = channel->wire_is_control;
-            std::vector<uint8_t>().swap(channel->wire);
-            std::string().swap(channel->wire_payload);
-            channel->wire_suffix_size = 0;
-            channel->wire_off = 0;
-            channel->wire_memory.reset();
-            channel->wire_is_control = false;
-            if (!control)
-                release_channel_slot(root, static_cast<size_t>(channel->channel_index));
-        }
-        return;
-    }
-    if (sent < 0 && would_block(sockerr())) return;
-    mark_session_closed(channel);
 }
 class Server {
 public:
@@ -1202,76 +783,66 @@ public:
     void start() {
         if (stopping_.load()) throw std::runtime_error("server has been stopped");
         if (running_.load()) throw std::runtime_error("already running");
-        if (port_ > static_cast<uint16_t>(UINT16_MAX - (CHANNEL_COUNT - 1)))
-            throw std::invalid_argument("base port must leave room for four additional ports");
-        try {
-            for (size_t channel = 0; channel < CHANNEL_COUNT; ++channel) {
-                addrinfo hints{};
-                hints.ai_family = AF_UNSPEC;
-                hints.ai_socktype = SOCK_STREAM;
-                hints.ai_flags = AI_PASSIVE;
-                addrinfo* results = nullptr;
-                const std::string service = std::to_string(static_cast<unsigned>(port_) + channel);
-                const int rc = getaddrinfo(host_.empty() ? nullptr : host_.c_str(),
-                                           service.c_str(), &hints, &results);
-                if (rc != 0) throw std::runtime_error("getaddrinfo failed for channel port");
-                socket_t listener = BAD_SOCKET;
-                for (addrinfo* item = results; item; item = item->ai_next) {
-                    listener = ::socket(item->ai_family, item->ai_socktype, item->ai_protocol);
-                    if (listener == BAD_SOCKET) continue;
-                    int one = 1;
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags = AI_PASSIVE;
+        addrinfo* results = nullptr;
+        const std::string service = std::to_string(port_);
+        const int rc = getaddrinfo(host_.empty() ? nullptr : host_.c_str(),
+                                   service.c_str(), &hints, &results);
+        if (rc != 0) throw std::runtime_error("getaddrinfo failed");
+        socket_t listener = BAD_SOCKET;
+        for (addrinfo* item = results; item; item = item->ai_next) {
+            listener = ::socket(item->ai_family, item->ai_socktype, item->ai_protocol);
+            if (listener == BAD_SOCKET) continue;
+            int one = 1;
 #ifdef _WIN32
-                    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
-                               reinterpret_cast<const char*>(&one), sizeof(one));
-                    const int bind_len = static_cast<int>(item->ai_addrlen);
+            setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+                       reinterpret_cast<const char*>(&one), sizeof(one));
 #else
-                    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-                    const socklen_t bind_len = static_cast<socklen_t>(item->ai_addrlen);
+            setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #endif
-                    if (::bind(listener, item->ai_addr, bind_len) == 0 &&
-                        ::listen(listener, SOMAXCONN) == 0) break;
-                    close_sock(listener);
-                    listener = BAD_SOCKET;
-                }
-                freeaddrinfo(results);
-                if (listener == BAD_SOCKET)
-                    throw std::runtime_error("could not bind/listen on port " + service);
-                try {
-                    nonblocking(listener);
-                } catch (...) {
-                    close_sock(listener);
-                    throw;
-                }
-                listeners_[channel] = listener;
+            if (::bind(listener, item->ai_addr,
+#ifdef _WIN32
+                       static_cast<int>(item->ai_addrlen)
+#else
+                       static_cast<socklen_t>(item->ai_addrlen)
+#endif
+                       ) == 0 && ::listen(listener, SOMAXCONN) == 0) {
+                break;
             }
+            close_sock(listener);
+            listener = BAD_SOCKET;
+        }
+        freeaddrinfo(results);
+        if (listener == BAD_SOCKET) throw std::runtime_error("could not bind/listen");
+        try {
+            nonblocking(listener);
         } catch (...) {
-            for (auto& listener : listeners_) {
-                if (listener != BAD_SOCKET) close_sock(listener);
-                listener = BAD_SOCKET;
-            }
+            close_sock(listener);
             throw;
         }
+        listener_ = listener;
         running_ = true;
         try {
             io_thread_ = std::thread([this] { io_loop(); });
         } catch (...) {
             running_ = false;
-            for (auto& listener : listeners_) {
-                if (listener != BAD_SOCKET) close_sock(listener);
-                listener = BAD_SOCKET;
-            }
+            close_sock(listener_);
+            listener_ = BAD_SOCKET;
             throw;
         }
     }
     void stop() {
         if (stopping_.exchange(true)) return;
         running_ = false;
-        for (auto& listener : listeners_) {
-            if (listener != BAD_SOCKET) close_sock(listener);
-            listener = BAD_SOCKET;
-        }
         if (io_thread_.joinable() && io_thread_.get_id() != std::this_thread::get_id())
             io_thread_.join();
+        if (listener_ != BAD_SOCKET) {
+            close_sock(listener_);
+            listener_ = BAD_SOCKET;
+        }
         std::vector<std::shared_ptr<Conn>> remaining;
         {
             std::lock_guard<std::mutex> lock(connections_mutex_);
@@ -1302,7 +873,6 @@ public:
         auto conn = find(as_string(cid));
         if (!conn) throw py::key_error("unknown cid");
         conn->backpressure = value;
-        conn->cv.notify_all();
     }
     void close_client(py::bytes cid) {
         const std::string id = as_string(cid);
@@ -1324,11 +894,32 @@ public:
             throw std::runtime_error(
                 "normal send is unavailable before authentication; use send_handshake(temp_cid, data)");
         const std::string payload = as_string(payload_bytes);
-        // EIDs are opaque correlation labels. Replay/authenticity decisions
-        // belong to the application layer; the transport only frames and orders.
-        const auto requested_eid = eid_arg(eid_obj);
-        const std::string eid = requested_eid ? *requested_eid : generate_eid();
-        enqueue(conn, Pending{0, std::move(payload), eid, true, {}});
+        auto requested_eid = eid_arg(eid_obj);
+        std::string eid;
+        if (requested_eid) {
+            eid = *requested_eid;
+            const EidResult result = touch_eid(conn, eid);
+            if (result == EidResult::Limit)
+                throw py::value_error("too many active eids for this connection");
+            if (result == EidResult::Closed)
+                throw std::runtime_error("connection closed");
+        } else {
+            bool generated = false;
+            for (int tries = 0; tries < 16; ++tries) {
+                eid = random_bytes(EID_N);
+                const EidResult result = touch_eid(conn, eid);
+                if (result == EidResult::Fresh) {
+                    generated = true;
+                    break;
+                }
+                if (result == EidResult::Limit)
+                    throw py::value_error("too many active eids for this connection");
+                if (result == EidResult::Closed)
+                    throw std::runtime_error("connection closed");
+            }
+            if (!generated) throw std::runtime_error("could not generate a unique eid");
+        }
+        enqueue(conn, Pending{payload, eid, true, {}});
         return py::object(as_bytes(eid));
     }
     void send_handshake(py::bytes temp_cid, py::bytes payload_bytes) {
@@ -1336,7 +927,7 @@ public:
         if (!conn) throw py::key_error("unknown temp_cid");
         if (conn->authed.load(std::memory_order_acquire))
             throw std::runtime_error("handshake send only allowed before auth");
-        enqueue(conn, Pending{0, as_string(payload_bytes), {}, false, {}});
+        enqueue(conn, Pending{as_string(payload_bytes), {}, false, {}});
     }
     py::object recv(py::bytes cid_bytes, py::object eid_obj, py::object timeout_obj) {
         auto conn = find(as_string(cid_bytes));
@@ -1362,88 +953,59 @@ public:
         if (new_id.empty()) throw py::value_error("new_cid must not be empty");
         if (new_id.size() > MAX_CID_BYTES)
             throw py::value_error("new_cid exceeds the 256-byte limit");
-        std::shared_ptr<Conn> conn;
-        std::vector<std::string> deferred_callbacks;
-        {
-            std::lock_guard<std::mutex> lock(ids_mutex_);
-            auto temp_it = temporary_ids_.find(temp);
-            if (temp_it == temporary_ids_.end()) throw py::key_error("unknown temp_cid");
-            conn = temp_it->second;
-            if (conn->closed) throw std::runtime_error("connection closed");
-            if (ids_.count(new_id)) throw py::value_error("new_cid already in use");
-            if (!confirmation_payload.is_none()) {
-                enqueue(conn, Pending{0, as_string(py::cast<py::bytes>(confirmation_payload)), {}, false, {}});
-            }
-            std::string conn_id_copy = new_id;
-            ids_.emplace(new_id, conn);
-            conn->cid = std::move(conn_id_copy);
-            conn->authed.store(true, std::memory_order_release);
-            temporary_ids_.erase(temp_it);
-            {
-                std::lock_guard<std::mutex> session_lock(conn->mutex);
-                const auto now = std::chrono::steady_clock::now();
-                cleanup_eid_activity_locked(*conn, now, true);
-                deferred_callbacks.assign(conn->deferred_exchange_callbacks.begin(),
-                                           conn->deferred_exchange_callbacks.end());
-                conn->deferred_exchange_callbacks.clear();
-            }
-            conn->cv.notify_all();
+        std::lock_guard<std::mutex> lock(ids_mutex_);
+        auto temp_it = temporary_ids_.find(temp);
+        if (temp_it == temporary_ids_.end()) throw py::key_error("unknown temp_cid");
+        auto conn = temp_it->second;
+        if (conn->closed) throw std::runtime_error("connection closed");
+        if (ids_.count(new_id)) throw py::value_error("new_cid already in use");
+        if (!confirmation_payload.is_none()) {
+            enqueue(conn, Pending{as_string(py::cast<py::bytes>(confirmation_payload)), {}, false, {}});
         }
-        for (const auto& eid : deferred_callbacks) {
-            const std::string id = new_id;
-            const uint64_t connection_id = conn->connection_id;
-            try {
-                exchanges_.submit([this, id, eid, connection_id] {
-                    auto current = find(id);
-                    if (!current || current->closed || current->connection_id != connection_id) return;
-                    call_exchange(id, eid, connection_id);
-                });
-            } catch (const std::exception& e) {
-                log_callback_error("on_exchange", e.what());
-            }
-        }
+        std::string conn_id_copy = new_id;
+        ids_.emplace(new_id, conn);
+        conn->cid = std::move(conn_id_copy);
+        conn->authed.store(true, std::memory_order_release);
+        temporary_ids_.erase(temp_it);
+        conn->cv.notify_all();
         return true;
     }
 private:
     static py::object pop(const std::shared_ptr<Conn>& conn,
                           const std::optional<std::string>& eid,
                           bool want_authed, const std::optional<double>& timeout) {
-        std::string payload;
-        bool found = false;
+        std::unique_lock<std::mutex> lock(conn->mutex);
+        auto predicate = [&] {
+            if (conn->closed || conn->authed.load(std::memory_order_acquire) != want_authed)
+                return true;
+            return std::any_of(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
+                return message.authed == want_authed && (!want_authed || message.eid == *eid);
+            });
+        };
+        bool ready = false;
         {
-            // Keep the session mutex inside the GIL-released scope.  In
-            // particular, do not return from the condition-variable wait with
-            // this mutex held and then reacquire the GIL: a concurrent sender
-            // may hold the GIL while waiting for this same mutex.
             py::gil_scoped_release release;
-            std::unique_lock<std::mutex> lock(conn->mutex);
-            auto predicate = [&] {
-                if (conn->closed || conn->authed.load(std::memory_order_acquire) != want_authed)
-                    return true;
-                return std::any_of(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
-                    return message.authed == want_authed && (!want_authed || message.eid == *eid);
-                });
-            };
-            bool ready = false;
             if (timeout) {
                 ready = conn->cv.wait_for(lock, std::chrono::duration<double>(*timeout), predicate);
             } else {
                 conn->cv.wait(lock, predicate);
                 ready = true;
             }
-            if (ready) {
-                auto it = std::find_if(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
-                    return message.authed == want_authed && (!want_authed || message.eid == *eid);
-                });
-                if (it != conn->recvq.end()) {
-                    payload = std::move(it->payload);
-                    conn->recvq.erase(it);
-                    found = true;
-                }
-            }
-        } // The mutex is released before py::gil_scoped_release reacquires the GIL.
-        conn->cv.notify_all();
-        if (!found) return py::none();
+        }
+        if (!ready) {
+            lock.unlock();
+            return py::none();
+        }
+        auto it = std::find_if(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
+            return message.authed == want_authed && (!want_authed || message.eid == *eid);
+        });
+        if (it == conn->recvq.end()) {
+            lock.unlock();
+            return py::none();
+        }
+        std::string payload = std::move(it->payload);
+        conn->recvq.erase(it);
+        lock.unlock();
         return py::object(as_bytes(payload));
     }
     std::shared_ptr<Conn> find(const std::string& id) {
@@ -1459,7 +1021,7 @@ private:
     void enqueue(const std::shared_ptr<Conn>& conn, Pending pending) {
         const size_t max_payload = pending.authed ? MAX_AUTH : MAX_UNAUTH;
         if (pending.payload.size() > max_payload) {
-            if (pending.authed) throw py::value_error("payload exceeds 32 MiB length limit");
+            if (pending.authed) throw py::value_error("payload exceeds 25-bit length limit");
             throw py::value_error("handshake payload exceeds 65535 bytes");
         }
         std::lock_guard<std::mutex> lock(conn->mutex);
@@ -1470,7 +1032,6 @@ private:
                                      pending.payload.size() + sizeof(Pending) + 32);
         if (!pending.memory) throw py::value_error("buffer budget exhausted");
         conn->sendq.push_back(std::move(pending));
-        conn->cv.notify_all();
     }
     static std::string peer_address(const sockaddr_storage& address) {
         char out[INET6_ADDRSTRLEN]{};
@@ -1518,23 +1079,7 @@ private:
         times.push_back(now);
         return true;
     }
-    void start_channel_workers(const std::shared_ptr<Conn>& root,
-                               const std::shared_ptr<Conn>& channel) {
-        channel->send_thread = std::thread([this, root, channel] {
-            send_loop(root, channel);
-        });
-        try {
-            channel->recv_thread = std::thread([this, root, channel] {
-                recv_loop(root, channel);
-            });
-        } catch (...) {
-            mark_session_closed(channel);
-            root->cv.notify_all();
-            if (channel->send_thread.joinable()) channel->send_thread.join();
-            throw;
-        }
-    }
-    void accept_base_ready() {
+    void accept_ready() {
         for (size_t accepted = 0; accepted < MAX_ACCEPT_PER_TICK; ++accepted) {
             sockaddr_storage address{};
 #ifdef _WIN32
@@ -1542,7 +1087,7 @@ private:
 #else
             socklen_t address_len = sizeof(address);
 #endif
-            const socket_t sock = ::accept(listeners_[0], reinterpret_cast<sockaddr*>(&address), &address_len);
+            const socket_t sock = ::accept(listener_, reinterpret_cast<sockaddr*>(&address), &address_len);
             if (sock == BAD_SOCKET) {
                 if (would_block(sockerr())) break;
                 break;
@@ -1559,209 +1104,114 @@ private:
             }
             const std::string peer = peer_address(address);
             bool peer_ok = false;
-            try { peer_ok = allow_peer(peer); }
-            catch (...) { close_sock(sock); continue; }
+            try {
+                peer_ok = allow_peer(peer);
+            } catch (...) {
+                close_sock(sock);
+                continue;
+            }
             if (connection_count >= MAX_CONNECTIONS ||
                 unauth_count >= MAX_UNAUTH_CONNECTIONS || !peer_ok) {
                 close_sock(sock);
                 continue;
             }
-            std::shared_ptr<Conn> root;
+            std::shared_ptr<Conn> conn;
             bool temp_inserted = false;
             try {
                 tune_socket(sock);
                 nonblocking(sock);
-                root = std::make_shared<Conn>(global_memory_);
-                root->sock = sock;
-                root->server_side = true;
-                root->channel_index = 0;
-                root->magic1 = magic1_;
-                root->magic2 = magic2_;
-                root->peer = peer;
-                root->association_token = random_bytes(ASSOCIATION_TOKEN_N);
-                root->connect_time = std::chrono::steady_clock::now();
-                root->connection_id = next_connection_id_++;
-                const size_t greeting_size = MAGIC_N * 2 + ASSOCIATION_TOKEN_N;
-                root->wire_memory = Lease::make(root->global_memory, root->local_memory, greeting_size);
-                if (!root->wire_memory) throw std::runtime_error("connection buffer budget exhausted");
-                root->wire.reserve(greeting_size);
-                root->wire.insert(root->wire.end(), magic1_.begin(), magic1_.end());
-                root->wire.insert(root->wire.end(), magic2_.begin(), magic2_.end());
-                root->wire.insert(root->wire.end(), root->association_token.begin(), root->association_token.end());
-                root->wire_is_control = true;
+                conn = std::make_shared<Conn>(global_memory_);
+                conn->sock = sock;
+                conn->server_side = true;
+                conn->magic1 = magic1_;
+                conn->magic2 = magic2_;
+                conn->peer = peer;
+                conn->connect_time = std::chrono::steady_clock::now();
+                conn->connection_id = next_connection_id_++;
+                conn->wire_memory = Lease::make(conn->global_memory, conn->local_memory, 16);
+                if (!conn->wire_memory) throw std::runtime_error("global buffer budget exhausted");
+                conn->wire.reserve(16);
+                conn->wire.insert(conn->wire.end(), magic1_.begin(), magic1_.end());
+                conn->wire.insert(conn->wire.end(), magic2_.begin(), magic2_.end());
                 {
                     std::lock_guard<std::mutex> lock(ids_mutex_);
                     do {
-                        root->temp_cid = random_bytes(EID_N);
-                    } while (temporary_ids_.count(root->temp_cid) || ids_.count(root->temp_cid));
-                    temporary_ids_.emplace(root->temp_cid, root);
+                        conn->temp_cid = random_bytes(EID_N);
+                    } while (temporary_ids_.count(conn->temp_cid) || ids_.count(conn->temp_cid));
+                    temporary_ids_.emplace(conn->temp_cid, conn);
                     temp_inserted = true;
                 }
                 {
                     std::lock_guard<std::mutex> lock(connections_mutex_);
-                    connections_.push_back(root);
+                    connections_.push_back(conn);
                 }
                 ++peer_counts_[peer];
-                start_channel_workers(root, root);
             } catch (...) {
-                if (temp_inserted && root) {
+                if (temp_inserted) {
                     std::lock_guard<std::mutex> lock(ids_mutex_);
-                    temporary_ids_.erase(root->temp_cid);
+                    temporary_ids_.erase(conn->temp_cid);
                 }
-                if (root) clear_conn_io_state(root);
+                if (conn) clear_conn_io_state(conn);
                 else close_sock(sock);
             }
         }
     }
-    void accept_aux_ready(size_t channel_index) {
-        const std::string expected_marker = "EFSCHN02";
-        static const uint8_t ack[8] = {'E','F','S','-','O','K','A','Y'};
-        for (size_t accepted = 0; accepted < MAX_ACCEPT_PER_TICK; ++accepted) {
-            sockaddr_storage address{};
-#ifdef _WIN32
-            int address_len = sizeof(address);
-#else
-            socklen_t address_len = sizeof(address);
-#endif
-            const socket_t sock = ::accept(listeners_[channel_index],
-                                           reinterpret_cast<sockaddr*>(&address), &address_len);
-            if (sock == BAD_SOCKET) {
-                if (would_block(sockerr())) break;
-                break;
+    void cleanup_exchanges(const std::shared_ptr<Conn>& conn) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - conn->last_cleanup < CLEANUP_INTERVAL) return;
+        conn->last_cleanup = now;
+        std::vector<std::string> expired;
+        {
+            std::lock_guard<std::mutex> lock(conn->mutex);
+            for (auto it = conn->eid_activity.begin(); it != conn->eid_activity.end();) {
+                if (now - it->second >= EID_TTL) {
+                    expired.push_back(it->first);
+                    it = conn->eid_activity.erase(it);
+                } else {
+                    ++it;
+                }
             }
-            std::shared_ptr<Conn> channel;
-            std::shared_ptr<Conn> root;
-            try {
-                tune_socket(sock);
-                nonblocking(sock);
-                std::array<uint8_t, 8 + ASSOCIATION_TOKEN_N> hello{};
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-                if (!recv_exact_deadline(sock, hello.data(), hello.size(), deadline) ||
-                    std::memcmp(hello.data(), expected_marker.data(), expected_marker.size()) != 0) {
-                    close_sock(sock);
-                    continue;
-                }
-                const std::string token(reinterpret_cast<const char*>(hello.data() + 8),
-                                        ASSOCIATION_TOKEN_N);
-                const std::string peer = peer_address(address);
-                {
-                    std::lock_guard<std::mutex> lock(connections_mutex_);
-                    for (const auto& candidate : connections_) {
-                        if (!candidate->closed && candidate->peer == peer &&
-                            candidate->association_token == token) {
-                            root = candidate;
-                            break;
-                        }
-                    }
-                }
-                if (!root) { close_sock(sock); continue; }
-                channel = std::make_shared<Conn>(global_memory_);
-                channel->sock = sock;
-                channel->parent = root;
-                channel->channel_index = static_cast<int>(channel_index);
-                channel->server_side = true;
-                channel->connection_id = root->connection_id;
-                channel->magic1 = root->magic1;
-                channel->magic2 = root->magic2;
-                channel->peer = root->peer;
-                channel->connect_time = root->connect_time;
-                channel->global_memory = root->global_memory;
-                channel->local_memory = root->local_memory;
-                {
-                    std::lock_guard<std::mutex> lock(root->mutex);
-                    if (root->closed || root->channels[channel_index]) {
-                        close_sock(sock);
-                        continue;
-                    }
-                    root->channels[channel_index] = channel;
-                }
-                if (!send_exact_deadline(sock, ack, sizeof(ack), deadline)) {
-                    {
-                        std::lock_guard<std::mutex> lock(root->mutex);
-                        if (root->channels[channel_index] == channel)
-                            root->channels[channel_index].reset();
-                    }
-                    close_sock(sock);
-                    continue;
-                }
-                start_channel_workers(root, channel);
-            } catch (const std::exception& e) {
-                log_callback_error("channel_association", e.what());
-                if (root && channel) mark_session_closed(channel);
-                else close_sock(sock);
-            } catch (...) {
-                if (root && channel) mark_session_closed(channel);
-                else close_sock(sock);
+            if (!expired.empty()) {
+                auto is_expired = [&](const std::string& eid) {
+                    return std::binary_search(expired.begin(), expired.end(), eid);
+                };
+                conn->recvq.erase(std::remove_if(conn->recvq.begin(), conn->recvq.end(),
+                    [&](const Message& message) { return message.authed && is_expired(message.eid); }),
+                    conn->recvq.end());
+                conn->sendq.erase(std::remove_if(conn->sendq.begin(), conn->sendq.end(),
+                    [&](const Pending& pending) { return pending.authed && is_expired(pending.eid); }),
+                    conn->sendq.end());
+                conn->cv.notify_all();
             }
         }
     }
-    void accept_ready(size_t channel_index) {
-        if (channel_index == 0) accept_base_ready();
-        else accept_aux_ready(channel_index);
-    }
-    bool deliver_message(const std::shared_ptr<Conn>& channel, bool authed,
-                         const std::string& eid, uint64_t counter, std::string payload,
+    bool deliver_message(const std::shared_ptr<Conn>& conn, bool authed,
+                         const std::string& eid, std::string payload,
                          std::shared_ptr<Lease> memory, uint64_t connection_id) {
-        auto conn = logical_session(channel);
-        bool dispatch_exchange_now = false;
+        bool fresh_eid = false;
         try {
             std::lock_guard<std::mutex> lock(conn->mutex);
-            if (conn->closed || conn->recvq.size() >= RECV_QUEUE_LIMIT) return false;
-            // Ignore delayed handshake frames once this endpoint has committed to auth.
-            if (!authed && conn->authed.load(std::memory_order_acquire)) return true;
-            // Handshake frames use counter zero. Authenticated traffic uses a
-            // bounded five-counter selective-repeat window with cumulative ACKs.
+            if (conn->closed || conn->recvq.size() >= QUEUE_LIMIT) return false;
             if (authed) {
-                if (counter == 0) return true;
-                // Fixed-size selective-repeat window. This is transport ordering,
-                // not application replay protection: it buffers up to five
-                // out-of-order frame numbers and suppresses duplicate frame IDs.
-                if (counter <= conn->recv_contiguous_counter ||
-                    counter - conn->recv_contiguous_counter > 5) {
-                    queue_ack_locked(*conn, conn->recv_contiguous_counter);
-                    return true;
-                }
-                const unsigned offset = static_cast<unsigned>(
-                    counter - conn->recv_contiguous_counter - 1);
-                const uint8_t bit = static_cast<uint8_t>(1u << offset);
-                if (conn->recv_counter_window_bits & bit) {
-                    queue_ack_locked(*conn, conn->recv_contiguous_counter);
-                    return true;
-                }
-                conn->recv_counter_window_bits = static_cast<uint8_t>(
-                    conn->recv_counter_window_bits | bit);
-                bool advanced = false;
-                while (conn->recv_counter_window_bits & 0x01u) {
-                    ++conn->recv_contiguous_counter;
-                    conn->recv_counter_window_bits = static_cast<uint8_t>(
-                        conn->recv_counter_window_bits >> 1);
-                    advanced = true;
-                }
-                if (advanced) queue_ack_locked(*conn, conn->recv_contiguous_counter);
-            }
-            if (authed && has_on_exchange_) {
-                // Refresh activity on every message. Only a new or expired
-                // activity window triggers a callback; messages are never
-                // filtered or coalesced in recvq.
                 const auto now = std::chrono::steady_clock::now();
                 auto it = conn->eid_activity.find(eid);
-                const bool fresh = it == conn->eid_activity.end() ||
-                    now - it->second >= EID_ACTIVITY_TTL;
-                if (it == conn->eid_activity.end())
-                    conn->eid_activity.emplace(eid, now);
-                else
+                if (it != conn->eid_activity.end()) {
                     it->second = now;
-                if (fresh) {
-                    if (conn->authed.load(std::memory_order_acquire))
-                        dispatch_exchange_now = true;
-                    else
-                        conn->deferred_exchange_callbacks.insert(eid);
+                } else {
+                    for (auto old = conn->eid_activity.begin(); old != conn->eid_activity.end();) {
+                        if (now - old->second >= EID_TTL) old = conn->eid_activity.erase(old);
+                        else ++old;
+                    }
+                    if (conn->eid_activity.size() >= MAX_ACTIVE_EIDS_PER_CONNECTION) {
+                        conn->closed = true;
+                        conn->cv.notify_all();
+                        return false;
+                    }
+                    conn->eid_activity.emplace(eid, now);
+                    fresh_eid = true;
                 }
             }
-            Message message{counter, eid, std::move(payload), authed, std::move(memory)};
-            auto position = std::upper_bound(conn->recvq.begin(), conn->recvq.end(), counter,
-                [](uint64_t value, const Message& queued) { return value < queued.counter; });
-            conn->recvq.insert(position, std::move(message));
+            conn->recvq.push_back(Message{eid, std::move(payload), authed, std::move(memory)});
             conn->cv.notify_all();
         } catch (...) {
             conn->closed = true;
@@ -1781,7 +1231,7 @@ private:
             } catch (const std::exception& e) {
                 log_callback_error("handshake_worker", e.what());
             }
-        } else if (dispatch_exchange_now) {
+        } else if (authed && fresh_eid && has_on_exchange_) {
             const std::string id = conn->cid;
             try {
                 exchanges_.submit([this, id, eid, connection_id] {
@@ -1809,6 +1259,10 @@ private:
     void call_exchange(std::string id, std::string eid, uint64_t connection_id) {
         auto conn = find(id);
         if (!conn || conn->closed || conn->connection_id != connection_id) return;
+        {
+            std::lock_guard<std::mutex> lock(conn->mutex);
+            if (!conn->eid_activity.count(eid)) return;
+        }
         py::gil_scoped_acquire acquire;
         try {
             on_exchange_(as_bytes(id), as_bytes(eid));
@@ -1816,155 +1270,123 @@ private:
             log_callback_error("on_exchange", e.what());
         }
     }
-    void read_ready(const std::shared_ptr<Conn>& root,
-                    const std::shared_ptr<Conn>& channel) {
-        std::lock_guard<std::mutex> channel_lock(channel->recv_lock);
-        uint8_t buffer[256 * 1024];
+    void read_ready(const std::shared_ptr<Conn>& conn) {
+        uint8_t buffer[16 * 1024];
         size_t total_read = 0;
-        while (!root->closed && !channel->closed && total_read < MAX_READ_PER_TICK) {
-            if (root->backpressure || !has_recv_room(root)) return;
-            const size_t free_budget = root->local_memory->available();
-            const size_t input_budget = channel->input.size() < MAX_INPUT_BUFFER
-                ? MAX_INPUT_BUFFER - channel->input.size() : 0;
-            if (free_budget == 0 || input_budget == 0) return;
-            size_t request = std::min({sizeof(buffer), MAX_READ_PER_TICK - total_read,
-                                       free_budget, input_budget});
-            if (request == 0) return;
-            const size_t required = channel->input.size() + request;
-            if (required > MAX_INPUT_BUFFER || !ensure_input_capacity(*channel, required)) {
-                // Do not consume socket bytes unless bounded memory is reserved.
-                channel->memory_backpressure = true;
-                channel->blocked_memory_need = required;
-                return;
-            }
-            channel->memory_backpressure = false;
-            channel->blocked_memory_need = 0;
+        while (!conn->closed && total_read < MAX_READ_PER_TICK) {
+            if (conn->backpressure || !has_recv_room(conn)) return;
+            const size_t request = std::min(sizeof(buffer), MAX_READ_PER_TICK - total_read);
 #ifdef _WIN32
-            const int got = ::recv(channel->sock, reinterpret_cast<char*>(buffer),
+            const int got = ::recv(conn->sock, reinterpret_cast<char*>(buffer),
                                    static_cast<int>(request), 0);
 #else
-            const ssize_t got = ::recv(channel->sock, buffer, request, 0);
+            const ssize_t got = ::recv(conn->sock, buffer, request, 0);
 #endif
             if (got > 0) {
                 total_read += static_cast<size_t>(got);
-                channel->input.insert(channel->input.end(), buffer, buffer + got);
                 try {
-                    const uint64_t id = root->connection_id;
-                    parse_buffered(channel, [&](bool authed, const std::string& eid,
-                                                uint64_t counter, std::string payload,
-                                                std::shared_ptr<Lease> memory) {
-                        return deliver_message(root, authed, eid, counter,
-                                                std::move(payload), std::move(memory), id);
+                    if (static_cast<size_t>(got) > MAX_INPUT_BUFFER - conn->input.size() ||
+                        !ensure_input_capacity(*conn, conn->input.size() + static_cast<size_t>(got))) {
+                        conn->closed = true;
+                        return;
+                    }
+                    conn->input.insert(conn->input.end(), buffer, buffer + got);
+                    const uint64_t id = conn->connection_id;
+                    parse_buffered(conn, [&](bool authed, const std::string& eid,
+                                             std::string payload, std::shared_ptr<Lease> memory) {
+                        return deliver_message(conn, authed, eid, std::move(payload),
+                                               std::move(memory), id);
                     });
-                    if (channel->memory_backpressure) return;
                 } catch (...) {
-                    mark_session_closed(channel);
+                    conn->closed = true;
+                    conn->cv.notify_all();
                     return;
                 }
-                if (!has_recv_room(root)) return;
+                if (conn->closed || !has_recv_room(conn)) return;
                 continue;
             }
-            if (got == 0) { mark_session_closed(channel); return; }
+            if (got == 0) {
+                conn->closed = true;
+                conn->cv.notify_all();
+                return;
+            }
             if (would_block(sockerr())) return;
-            mark_session_closed(channel);
+            conn->closed = true;
+            conn->cv.notify_all();
             return;
         }
     }
-    void write_ready(const std::shared_ptr<Conn>& root,
-                     const std::shared_ptr<Conn>& channel) {
-        std::lock_guard<std::mutex> channel_lock(channel->send_lock);
-        if (root->closed || channel->closed || channel->sock == BAD_SOCKET) return;
-        write_channel_ready(root, channel);
+    bool has_pending_write(const std::shared_ptr<Conn>& conn) {
+        if (conn->wire_off < conn->wire.size()) return true;
+        std::lock_guard<std::mutex> lock(conn->mutex);
+        return !conn->sendq.empty();
     }
-    void send_loop(const std::shared_ptr<Conn>& root,
-                   const std::shared_ptr<Conn>& channel) noexcept {
-        while (running_.load() && !root->closed && !channel->closed) {
+    void write_ready(const std::shared_ptr<Conn>& conn) {
+        if (conn->closed) return;
+        if (conn->wire_off >= conn->wire.size()) {
+            std::vector<uint8_t>().swap(conn->wire);
+            conn->wire_off = 0;
+            conn->wire_memory.reset();
+            Pending pending;
+            bool have_pending = false;
+            {
+                std::lock_guard<std::mutex> lock(conn->mutex);
+                if (!conn->sendq.empty()) {
+                    pending = std::move(conn->sendq.front());
+                    conn->sendq.pop_front();
+                    have_pending = true;
+                }
+            }
+            if (!have_pending) return;
+            const size_t header_size = pending.authed ? AUTH_HEAD + EID_N : UNAUTH_HEAD;
+            const size_t frame_size = MAGIC_N + header_size + pending.payload.size() + MAGIC_N;
             try {
-                write_ready(root, channel);
-                if (root->closed || channel->closed) break;
-                if (channel->wire.empty()) {
-                    std::unique_lock<std::mutex> lock(root->mutex);
-                    root->cv.wait_for(lock, std::chrono::milliseconds(20));
-                    continue;
-                }
-                pollfd_t pfd{};
-                pfd.fd = channel->sock;
-                pfd.events = POLLOUT;
-                const int rc = poll_many(&pfd, 1, IO_POLL_INTERVAL_MS);
-                if (rc < 0) {
-                    if (interrupted_error(sockerr())) continue;
-                    mark_session_closed(channel);
-                    break;
-                }
-                if (rc > 0) {
-                    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                        mark_session_closed(channel);
-                        break;
-                    }
-                    if (pfd.revents & POLLOUT) write_ready(root, channel);
-                }
-            } catch (const std::exception& e) {
-                log_callback_error("server_send", e.what());
-                mark_session_closed(channel);
+                conn->wire_memory = Lease::make(conn->global_memory, conn->local_memory, frame_size);
             } catch (...) {
-                log_callback_error("server_send", "unknown exception");
-                mark_session_closed(channel);
+                conn->closed = true;
+                conn->cv.notify_all();
+                return;
+            }
+            if (!conn->wire_memory) {
+                conn->closed = true;
+                conn->cv.notify_all();
+                return;
+            }
+            try {
+                conn->wire = make_frame(*conn, pending);
+            } catch (...) {
+                conn->closed = true;
+                conn->cv.notify_all();
+                return;
             }
         }
-    }
-    void recv_loop(const std::shared_ptr<Conn>& root,
-                   const std::shared_ptr<Conn>& channel) noexcept {
-        while (running_.load() && !root->closed && !channel->closed) {
-            try {
-                if (channel->channel_index == 0) cleanup_eid_activity(root);
-                if (!channel->input.empty() && has_recv_room(root)) {
-                    const uint64_t id = root->connection_id;
-                    parse_buffered(channel, [&](bool authed, const std::string& eid,
-                                                uint64_t counter, std::string payload,
-                                                std::shared_ptr<Lease> memory) {
-                        return deliver_message(root, authed, eid, counter,
-                                               std::move(payload), std::move(memory), id);
-                    });
-                }
-                if (root->closed || channel->closed) break;
-                if (channel->memory_backpressure &&
-                    root->local_memory->available() >= std::max<size_t>(16 * 1024, channel->blocked_memory_need.load())) {
-                    channel->memory_backpressure = false;
-                    channel->blocked_memory_need = 0;
-                }
-                if (root->backpressure || channel->memory_backpressure || !has_recv_room(root)) {
-                    std::unique_lock<std::mutex> lock(root->mutex);
-                    root->cv.wait_for(lock, std::chrono::milliseconds(20));
-                    continue;
-                }
-                pollfd_t pfd{};
-                pfd.fd = channel->sock;
-                pfd.events = POLLIN;
-                const int rc = poll_many(&pfd, 1, IO_POLL_INTERVAL_MS);
-                if (rc < 0) {
-                    if (interrupted_error(sockerr())) continue;
-                    mark_session_closed(channel);
-                    break;
-                }
-                if (rc > 0) {
-                    if (pfd.revents & (POLLERR | POLLNVAL)) {
-                        mark_session_closed(channel);
-                        break;
-                    }
-                    if (pfd.revents & POLLIN) read_ready(root, channel);
-                    if (!root->closed && (pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
-                        mark_session_closed(channel);
-                        break;
-                    }
-                }
-            } catch (const std::exception& e) {
-                log_callback_error("server_recv", e.what());
-                mark_session_closed(channel);
-            } catch (...) {
-                log_callback_error("server_recv", "unknown exception");
-                mark_session_closed(channel);
+        if (conn->wire_off >= conn->wire.size()) return;
+        const size_t amount = std::min(MAX_WRITE_PER_TICK, conn->wire.size() - conn->wire_off);
+#ifdef _WIN32
+        const int sent = ::send(conn->sock,
+                                reinterpret_cast<const char*>(conn->wire.data() + conn->wire_off),
+                                static_cast<int>(amount), 0);
+#else
+#  ifdef MSG_NOSIGNAL
+        const ssize_t sent = ::send(conn->sock, conn->wire.data() + conn->wire_off,
+                                    amount, MSG_NOSIGNAL);
+#  else
+        const ssize_t sent = ::send(conn->sock, conn->wire.data() + conn->wire_off,
+                                    amount, 0);
+#  endif
+#endif
+        if (sent > 0) {
+            conn->wire_off += static_cast<size_t>(sent);
+            if (conn->wire_off == conn->wire.size()) {
+                std::vector<uint8_t>().swap(conn->wire);
+                conn->wire_off = 0;
+                conn->wire_memory.reset();
             }
+            return;
         }
+        if (sent < 0 && would_block(sockerr())) return;
+        conn->closed = true;
+        conn->cv.notify_all();
     }
     void queue_disconnect(const std::shared_ptr<Conn>& conn) noexcept {
         if (!has_on_disconnect_ || !conn ||
@@ -2069,18 +1491,51 @@ private:
                 const auto now = std::chrono::steady_clock::now();
                 for (const auto& conn : connections) {
                     if (conn->closed) continue;
-                    if (!conn->authed.load(std::memory_order_acquire) &&
-                        now - conn->connect_time > UNAUTH_TIMEOUT) {
+                    if (!conn->authed && now - conn->connect_time > UNAUTH_TIMEOUT) {
+                        conn->closed = true;
+                        conn->cv.notify_all();
+                        continue;
+                    }
+                    try {
+                        cleanup_exchanges(conn);
+                        if (!conn->input.empty() && has_recv_room(conn)) {
+                            const uint64_t id = conn->connection_id;
+                            parse_buffered(conn, [&](bool authed, const std::string& eid,
+                                                     std::string payload, std::shared_ptr<Lease> memory) {
+                                return deliver_message(conn, authed, eid, std::move(payload),
+                                                       std::move(memory), id);
+                            });
+                        }
+                    } catch (...) {
                         conn->closed = true;
                         conn->cv.notify_all();
                     }
                 }
                 cleanup_closed();
                 if (!running_.load()) break;
-                std::array<pollfd_t, CHANNEL_COUNT> poll_fds{};
-                for (size_t i = 0; i < CHANNEL_COUNT; ++i) {
-                    poll_fds[i].fd = listeners_[i];
-                    poll_fds[i].events = POLLIN;
+                std::vector<pollfd_t> poll_fds;
+                std::vector<std::shared_ptr<Conn>> poll_connections;
+                const socket_t listener = listener_;
+                size_t listener_index = static_cast<size_t>(-1);
+                if (listener != BAD_SOCKET) {
+                    pollfd_t pfd{};
+                    pfd.fd = listener;
+                    pfd.events = POLLIN;
+                    listener_index = poll_fds.size();
+                    poll_fds.push_back(pfd);
+                    poll_connections.push_back(nullptr);
+                }
+                connections = connection_snapshot();
+                for (const auto& conn : connections) {
+                    if (conn->closed || conn->sock == BAD_SOCKET) continue;
+                    short events = 0;
+                    if (!conn->backpressure && has_recv_room(conn)) events |= POLLIN;
+                    if (has_pending_write(conn)) events |= POLLOUT;
+                    pollfd_t pfd{};
+                    pfd.fd = conn->sock;
+                    pfd.events = events;
+                    poll_fds.push_back(pfd);
+                    poll_connections.push_back(conn);
                 }
                 const int rc = poll_many(poll_fds.data(), poll_fds.size(), IO_POLL_INTERVAL_MS);
                 if (rc < 0) {
@@ -2089,10 +1544,31 @@ private:
                     continue;
                 }
                 if (!running_.load()) break;
-                for (size_t i = 0; i < CHANNEL_COUNT; ++i) {
-                    if (poll_fds[i].revents & POLLIN) accept_ready(i);
-                    if (poll_fds[i].revents & (POLLERR | POLLNVAL)) {
-                        log_callback_error("server_listener", "listener poll error");
+                if (rc == 0) continue;
+                if (listener_index != static_cast<size_t>(-1) &&
+                    (poll_fds[listener_index].revents & POLLIN)) {
+                    accept_ready();
+                }
+                for (size_t i = 0; i < poll_fds.size(); ++i) {
+                    if (i == listener_index) continue;
+                    const auto& conn = poll_connections[i];
+                    if (!conn || conn->closed) continue;
+                    const short revents = poll_fds[i].revents;
+                    if (revents & (POLLERR | POLLNVAL)) {
+                        conn->closed = true;
+                        conn->cv.notify_all();
+                        continue;
+                    }
+                    if ((revents & POLLHUP) && !(poll_fds[i].events & POLLIN) &&
+                        !(poll_fds[i].events & POLLOUT)) {
+                        continue;
+                    }
+                    if (revents & POLLOUT) write_ready(conn);
+                    if (!conn->closed && (revents & POLLIN)) read_ready(conn);
+                    if (!conn->closed && (revents & POLLHUP) &&
+                        (poll_fds[i].events & POLLIN) && !(revents & POLLIN)) {
+                        conn->closed = true;
+                        conn->cv.notify_all();
                     }
                 }
                 cleanup_closed();
@@ -2126,7 +1602,7 @@ private:
     Pool exchanges_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
-    std::array<socket_t, CHANNEL_COUNT> listeners_{{BAD_SOCKET, BAD_SOCKET, BAD_SOCKET, BAD_SOCKET, BAD_SOCKET}};
+    socket_t listener_ = BAD_SOCKET;
     std::thread io_thread_;
     std::mutex ids_mutex_;
     std::mutex connections_mutex_;
@@ -2159,112 +1635,71 @@ public:
             close();
         }
     }
-    socket_t connect_socket(uint16_t target_port) {
+    void connect() {
+        if (connected_.load()) throw std::runtime_error("already connected");
+        if (stopping_.load()) throw std::runtime_error("client has been closed");
         addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         addrinfo* results = nullptr;
-        const std::string service = std::to_string(target_port);
+        const std::string service = std::to_string(port_);
         if (getaddrinfo(host_.c_str(), service.c_str(), &hints, &results) != 0)
-            throw std::runtime_error("getaddrinfo failed for client channel");
+            throw std::runtime_error("getaddrinfo failed");
         socket_t sock = BAD_SOCKET;
-        const auto deadline = std::chrono::steady_clock::now() + CONNECT_TIMEOUT;
+        const auto connect_deadline = std::chrono::steady_clock::now() + CONNECT_TIMEOUT;
         for (addrinfo* item = results; item; item = item->ai_next) {
-            if (std::chrono::steady_clock::now() >= deadline) break;
+            if (std::chrono::steady_clock::now() >= connect_deadline) break;
             sock = ::socket(item->ai_family, item->ai_socktype, item->ai_protocol);
             if (sock == BAD_SOCKET) continue;
             if (connect_with_deadline(sock, item->ai_addr,
-                                      static_cast<socket_len_t>(item->ai_addrlen), deadline))
+                                      static_cast<socket_len_t>(item->ai_addrlen),
+                                      connect_deadline)) {
                 break;
+            }
             close_sock(sock);
             sock = BAD_SOCKET;
         }
         freeaddrinfo(results);
         if (sock == BAD_SOCKET) throw std::runtime_error("connect failed or timed out");
-        return sock;
-    }
-    void start_channel_workers(const std::shared_ptr<Conn>& root,
-                               const std::shared_ptr<Conn>& channel) {
-        channel->send_thread = std::thread([this, root, channel] {
-            send_loop(root, channel);
-        });
-        try {
-            channel->recv_thread = std::thread([this, root, channel] {
-                recv_loop(root, channel);
-            });
-        } catch (...) {
-            mark_session_closed(channel);
-            if (channel->send_thread.joinable()) channel->send_thread.join();
-            throw;
+        std::array<char, MAGIC_N * 2> greeting{};
+        size_t received = 0;
+        const auto greeting_deadline = std::chrono::steady_clock::now() + GREETING_TIMEOUT;
+        while (received < greeting.size()) {
+            if (!wait_socket(sock, POLLIN, greeting_deadline)) {
+                close_sock(sock);
+                throw std::runtime_error("timed out receiving framing greeting");
+            }
+#ifdef _WIN32
+            const int got = ::recv(sock, greeting.data() + received,
+                                   static_cast<int>(greeting.size() - received), 0);
+#else
+            const ssize_t got = ::recv(sock, greeting.data() + received,
+                                       greeting.size() - received, 0);
+#endif
+            if (got > 0) {
+                received += static_cast<size_t>(got);
+            } else if (got < 0 && would_block(sockerr())) {
+                continue;
+            } else {
+                close_sock(sock);
+                throw std::runtime_error("failed to receive framing greeting");
+            }
         }
-    }
-    void connect() {
-        if (connected_.load()) throw std::runtime_error("already connected");
-        if (stopping_.load()) throw std::runtime_error("client has been closed");
-        if (port_ > static_cast<uint16_t>(UINT16_MAX - (CHANNEL_COUNT - 1)))
-            throw std::invalid_argument("base port must leave room for four additional ports");
-        socket_t base_sock = BAD_SOCKET;
-        std::shared_ptr<Conn> root;
+        tune_socket(sock);
+        auto conn = std::make_shared<Conn>(global_memory_);
+        conn->sock = sock;
+        conn->connection_id = 1;
+        conn->magic1.assign(greeting.data(), MAGIC_N);
+        conn->magic2.assign(greeting.data() + MAGIC_N, MAGIC_N);
+        magic1_ = conn->magic1;
+        magic2_ = conn->magic2;
+        conn_ = conn;
+        connected_ = true;
         try {
-            base_sock = connect_socket(port_);
-            std::array<uint8_t, MAGIC_N * 2 + ASSOCIATION_TOKEN_N> greeting{};
-            const auto greeting_deadline = std::chrono::steady_clock::now() + GREETING_TIMEOUT;
-            if (!recv_exact_deadline(base_sock, greeting.data(), greeting.size(), greeting_deadline))
-                throw std::runtime_error("timed out receiving multi-channel framing greeting");
-            tune_socket(base_sock);
-            root = std::make_shared<Conn>(global_memory_);
-            root->sock = base_sock;
-            root->connection_id = 1;
-            root->channel_index = 0;
-            root->magic1.assign(reinterpret_cast<const char*>(greeting.data()), MAGIC_N);
-            root->magic2.assign(reinterpret_cast<const char*>(greeting.data() + MAGIC_N), MAGIC_N);
-            root->association_token.assign(
-                reinterpret_cast<const char*>(greeting.data() + MAGIC_N * 2), ASSOCIATION_TOKEN_N);
-            magic1_ = root->magic1;
-            magic2_ = root->magic2;
-            for (size_t i = 1; i < CHANNEL_COUNT; ++i) {
-                const uint16_t target_port = static_cast<uint16_t>(port_ + i);
-                socket_t aux_sock = connect_socket(target_port);
-                try {
-                    tune_socket(aux_sock);
-                    const std::string marker = "EFSCHN02";
-                    std::array<uint8_t, 8 + ASSOCIATION_TOKEN_N> hello{};
-                    std::memcpy(hello.data(), marker.data(), marker.size());
-                    std::memcpy(hello.data() + 8, root->association_token.data(), ASSOCIATION_TOKEN_N);
-                    const auto association_deadline = std::chrono::steady_clock::now() + GREETING_TIMEOUT;
-                    if (!send_exact_deadline(aux_sock, hello.data(), hello.size(), association_deadline))
-                        throw std::runtime_error("failed to associate auxiliary channel");
-                    std::array<uint8_t, 8> ack{};
-                    if (!recv_exact_deadline(aux_sock, ack.data(), ack.size(), association_deadline) ||
-                        std::memcmp(ack.data(), "EFS-OKAY", 8) != 0)
-                        throw std::runtime_error("server rejected auxiliary channel association");
-                    auto channel = std::make_shared<Conn>(global_memory_);
-                    channel->sock = aux_sock;
-                    channel->parent = root;
-                    channel->channel_index = static_cast<int>(i);
-                    channel->connection_id = root->connection_id;
-                    channel->magic1 = root->magic1;
-                    channel->magic2 = root->magic2;
-                    channel->global_memory = root->global_memory;
-                    channel->local_memory = root->local_memory;
-                    root->channels[i] = channel;
-                    aux_sock = BAD_SOCKET;
-                } catch (...) {
-                    if (aux_sock != BAD_SOCKET) close_sock(aux_sock);
-                    throw;
-                }
-            }
-            conn_ = root;
-            connected_ = true;
-            for (size_t i = 0; i < CHANNEL_COUNT; ++i) {
-                auto channel = channel_at(root, i);
-                if (!channel) throw std::runtime_error("missing one of the five TCP channels");
-                start_channel_workers(root, channel);
-            }
+            io_thread_ = std::thread([this] { io_loop(); });
         } catch (...) {
             connected_ = false;
-            if (root) clear_conn_io_state(root);
-            else if (base_sock != BAD_SOCKET) close_sock(base_sock);
+            clear_conn_io_state(conn_);
             conn_.reset();
             throw;
         }
@@ -2276,8 +1711,10 @@ public:
         if (conn) {
             conn->closed = true;
             conn->cv.notify_all();
-            clear_conn_io_state(conn);
         }
+        if (io_thread_.joinable() && io_thread_.get_id() != std::this_thread::get_id())
+            io_thread_.join();
+        if (conn) clear_conn_io_state(conn);
         exchanges_.stop();
     }
     py::object send(py::bytes payload_bytes, py::object eid_obj) {
@@ -2287,18 +1724,39 @@ public:
             throw std::runtime_error(
                 "normal send is unavailable before authentication; use send_handshake(data)");
         const std::string payload = as_string(payload_bytes);
-        // EIDs are opaque correlation labels. Replay/authenticity decisions
-        // belong to the application layer; the transport only frames and orders.
-        const auto requested_eid = eid_arg(eid_obj);
-        const std::string eid = requested_eid ? *requested_eid : generate_eid();
-        enqueue(Pending{0, std::move(payload), eid, true, {}});
+        auto requested_eid = eid_arg(eid_obj);
+        std::string eid;
+        if (requested_eid) {
+            eid = *requested_eid;
+            const EidResult result = touch_eid(conn, eid);
+            if (result == EidResult::Limit)
+                throw py::value_error("too many active eids for this connection");
+            if (result == EidResult::Closed)
+                throw std::runtime_error("connection closed");
+        } else {
+            bool generated = false;
+            for (int tries = 0; tries < 16; ++tries) {
+                eid = random_bytes(EID_N);
+                const EidResult result = touch_eid(conn, eid);
+                if (result == EidResult::Fresh) {
+                    generated = true;
+                    break;
+                }
+                if (result == EidResult::Limit)
+                    throw py::value_error("too many active eids for this connection");
+                if (result == EidResult::Closed)
+                    throw std::runtime_error("connection closed");
+            }
+            if (!generated) throw std::runtime_error("could not generate a unique eid");
+        }
+        enqueue(Pending{payload, eid, true, {}});
         return py::object(as_bytes(eid));
     }
     void send_handshake(py::bytes payload_bytes) {
         auto conn = conn_;
         if (!conn || !connected_.load() || conn->authed.load(std::memory_order_acquire))
             throw std::runtime_error("handshake send only allowed while connected and unauthenticated");
-        enqueue(Pending{0, as_string(payload_bytes), {}, false, {}});
+        enqueue(Pending{as_string(payload_bytes), {}, false, {}});
     }
     py::object recv(py::object eid_obj, py::object timeout_obj) {
         auto conn = conn_;
@@ -2317,31 +1775,8 @@ public:
     }
     bool auth_finished() {
         if (!conn_ || !connected_.load()) throw std::runtime_error("not connected");
-        std::vector<std::string> deferred_callbacks;
-        {
-            std::lock_guard<std::mutex> lock(conn_->mutex);
-            const auto now = std::chrono::steady_clock::now();
-            cleanup_eid_activity_locked(*conn_, now, true);
-            conn_->authed.store(true, std::memory_order_release);
-            deferred_callbacks.assign(conn_->deferred_exchange_callbacks.begin(),
-                                      conn_->deferred_exchange_callbacks.end());
-            conn_->deferred_exchange_callbacks.clear();
-        }
+        conn_->authed.store(true, std::memory_order_release);
         conn_->cv.notify_all();
-        if (has_on_exchange_) {
-            for (const auto& eid : deferred_callbacks) {
-                const uint64_t connection_id = conn_->connection_id;
-                try {
-                    exchanges_.submit([this, eid, connection_id] {
-                        auto current = conn_;
-                        if (!current || current->closed || current->connection_id != connection_id) return;
-                        call_exchange(eid, connection_id);
-                    });
-                } catch (const std::exception& e) {
-                    log_callback_error("on_exchange", e.what());
-                }
-            }
-        }
         return true;
     }
     bool is_authed() const {
@@ -2356,7 +1791,6 @@ public:
     void set_backpressure(bool value) {
         if (!conn_) throw std::runtime_error("not connected");
         conn_->backpressure = value;
-        conn_->cv.notify_all();
     }
 private:
     void enqueue(Pending pending) {
@@ -2364,7 +1798,7 @@ private:
         if (!conn) throw std::runtime_error("not connected");
         const size_t max_payload = pending.authed ? MAX_AUTH : MAX_UNAUTH;
         if (pending.payload.size() > max_payload) {
-            if (pending.authed) throw py::value_error("payload exceeds 32 MiB length limit");
+            if (pending.authed) throw py::value_error("payload exceeds 25-bit length limit");
             throw py::value_error("handshake payload exceeds 65535 bytes");
         }
         std::lock_guard<std::mutex> lock(conn->mutex);
@@ -2375,116 +1809,108 @@ private:
                                      pending.payload.size() + sizeof(Pending) + 32);
         if (!pending.memory) throw py::value_error("buffer budget exhausted");
         conn->sendq.push_back(std::move(pending));
-        conn->cv.notify_all();
     }
     py::object pop(const std::optional<std::string>& eid, bool want_authed,
                    const std::optional<double>& timeout) {
         auto conn = conn_;
         if (!conn) return py::none();
-        std::string payload;
-        bool found = false;
+        std::unique_lock<std::mutex> lock(conn->mutex);
+        auto predicate = [&] {
+            if (conn->closed || conn->authed.load(std::memory_order_acquire) != want_authed)
+                return true;
+            return std::any_of(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
+                return message.authed == want_authed && (!want_authed || message.eid == *eid);
+            });
+        };
+        bool ready = false;
         {
-            // Release the session lock before the GIL is reacquired when the
-            // condition-variable wait returns; otherwise recv/send callers
-            // can deadlock through a GIL <-> session-mutex inversion.
             py::gil_scoped_release release;
-            std::unique_lock<std::mutex> lock(conn->mutex);
-            auto predicate = [&] {
-                if (conn->closed || conn->authed.load(std::memory_order_acquire) != want_authed)
-                    return true;
-                return std::any_of(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
-                    return message.authed == want_authed && (!want_authed || message.eid == *eid);
-                });
-            };
-            bool ready = false;
             if (timeout) {
                 ready = conn->cv.wait_for(lock, std::chrono::duration<double>(*timeout), predicate);
             } else {
                 conn->cv.wait(lock, predicate);
                 ready = true;
             }
-            if (ready) {
-                auto it = std::find_if(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
-                    return message.authed == want_authed && (!want_authed || message.eid == *eid);
-                });
-                if (it != conn->recvq.end()) {
-                    payload = std::move(it->payload);
-                    conn->recvq.erase(it);
-                    found = true;
-                }
-            }
         }
-        conn->cv.notify_all();
-        if (!found) return py::none();
+        if (!ready) {
+            lock.unlock();
+            return py::none();
+        }
+        auto it = std::find_if(conn->recvq.begin(), conn->recvq.end(), [&](const Message& message) {
+            return message.authed == want_authed && (!want_authed || message.eid == *eid);
+        });
+        if (it == conn->recvq.end()) {
+            lock.unlock();
+            return py::none();
+        }
+        std::string payload = std::move(it->payload);
+        conn->recvq.erase(it);
+        lock.unlock();
         return py::object(as_bytes(payload));
     }
-    bool deliver_message(const std::shared_ptr<Conn>& channel, bool authed,
-                         const std::string& eid, uint64_t counter, std::string payload,
+    void cleanup_exchanges(const std::shared_ptr<Conn>& conn) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - conn->last_cleanup < CLEANUP_INTERVAL) return;
+        conn->last_cleanup = now;
+        std::vector<std::string> expired;
+        {
+            std::lock_guard<std::mutex> lock(conn->mutex);
+            for (auto it = conn->eid_activity.begin(); it != conn->eid_activity.end();) {
+                if (now - it->second >= EID_TTL) {
+                    expired.push_back(it->first);
+                    it = conn->eid_activity.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (!expired.empty()) {
+                auto is_expired = [&](const std::string& id) {
+                    return std::binary_search(expired.begin(), expired.end(), id);
+                };
+                conn->recvq.erase(std::remove_if(conn->recvq.begin(), conn->recvq.end(),
+                    [&](const Message& message) { return message.authed && is_expired(message.eid); }),
+                    conn->recvq.end());
+                conn->sendq.erase(std::remove_if(conn->sendq.begin(), conn->sendq.end(),
+                    [&](const Pending& pending) { return pending.authed && is_expired(pending.eid); }),
+                    conn->sendq.end());
+                conn->cv.notify_all();
+            }
+        }
+    }
+    bool deliver_message(const std::shared_ptr<Conn>& conn, bool authed,
+                         const std::string& eid, std::string payload,
                          std::shared_ptr<Lease> memory, uint64_t connection_id) {
-        auto conn = logical_session(channel);
-        bool dispatch_exchange_now = false;
+        bool fresh_eid = false;
         try {
             std::lock_guard<std::mutex> lock(conn->mutex);
-            if (conn->closed || conn->recvq.size() >= RECV_QUEUE_LIMIT) return false;
-            if (!authed && conn->authed.load(std::memory_order_acquire)) return true;
+            if (conn->closed || conn->recvq.size() >= QUEUE_LIMIT) return false;
             if (authed) {
-                if (counter == 0) return true;
-                // Fixed-size selective-repeat window. This is transport ordering,
-                // not application replay protection: it buffers up to five
-                // out-of-order frame numbers and suppresses duplicate frame IDs.
-                if (counter <= conn->recv_contiguous_counter ||
-                    counter - conn->recv_contiguous_counter > 5) {
-                    queue_ack_locked(*conn, conn->recv_contiguous_counter);
-                    return true;
-                }
-                const unsigned offset = static_cast<unsigned>(
-                    counter - conn->recv_contiguous_counter - 1);
-                const uint8_t bit = static_cast<uint8_t>(1u << offset);
-                if (conn->recv_counter_window_bits & bit) {
-                    queue_ack_locked(*conn, conn->recv_contiguous_counter);
-                    return true;
-                }
-                conn->recv_counter_window_bits = static_cast<uint8_t>(
-                    conn->recv_counter_window_bits | bit);
-                bool advanced = false;
-                while (conn->recv_counter_window_bits & 0x01u) {
-                    ++conn->recv_contiguous_counter;
-                    conn->recv_counter_window_bits = static_cast<uint8_t>(
-                        conn->recv_counter_window_bits >> 1);
-                    advanced = true;
-                }
-                if (advanced) queue_ack_locked(*conn, conn->recv_contiguous_counter);
-            }
-            if (authed && has_on_exchange_) {
-                // Refresh activity on every message. Only a new or expired
-                // activity window triggers a callback; messages are never
-                // filtered or coalesced in recvq.
                 const auto now = std::chrono::steady_clock::now();
                 auto it = conn->eid_activity.find(eid);
-                const bool fresh = it == conn->eid_activity.end() ||
-                    now - it->second >= EID_ACTIVITY_TTL;
-                if (it == conn->eid_activity.end())
-                    conn->eid_activity.emplace(eid, now);
-                else
+                if (it != conn->eid_activity.end()) {
                     it->second = now;
-                if (fresh) {
-                    if (conn->authed.load(std::memory_order_acquire))
-                        dispatch_exchange_now = true;
-                    else
-                        conn->deferred_exchange_callbacks.insert(eid);
+                } else {
+                    for (auto old = conn->eid_activity.begin(); old != conn->eid_activity.end();) {
+                        if (now - old->second >= EID_TTL) old = conn->eid_activity.erase(old);
+                        else ++old;
+                    }
+                    if (conn->eid_activity.size() >= MAX_ACTIVE_EIDS_PER_CONNECTION) {
+                        conn->closed = true;
+                        conn->cv.notify_all();
+                        return false;
+                    }
+                    conn->eid_activity.emplace(eid, now);
+                    fresh_eid = true;
                 }
             }
-            Message message{counter, eid, std::move(payload), authed, std::move(memory)};
-            auto position = std::upper_bound(conn->recvq.begin(), conn->recvq.end(), counter,
-                [](uint64_t value, const Message& queued) { return value < queued.counter; });
-            conn->recvq.insert(position, std::move(message));
+            conn->recvq.push_back(Message{eid, std::move(payload), authed, std::move(memory)});
             conn->cv.notify_all();
         } catch (...) {
             conn->closed = true;
             conn->cv.notify_all();
             return false;
         }
-        if (dispatch_exchange_now) {
+        if (authed && fresh_eid && has_on_exchange_) {
             try {
                 exchanges_.submit([this, eid, connection_id] {
                     auto current = conn_;
@@ -2501,6 +1927,10 @@ private:
     void call_exchange(std::string eid, uint64_t connection_id) {
         auto conn = conn_;
         if (!conn || conn->closed || conn->connection_id != connection_id) return;
+        {
+            std::lock_guard<std::mutex> lock(conn->mutex);
+            if (!conn->eid_activity.count(eid)) return;
+        }
         py::gil_scoped_acquire acquire;
         try {
             on_exchange_(as_bytes(eid));
@@ -2508,172 +1938,181 @@ private:
             log_callback_error("on_exchange", e.what());
         }
     }
-    void read_ready(const std::shared_ptr<Conn>& root,
-                    const std::shared_ptr<Conn>& channel) {
-        std::lock_guard<std::mutex> channel_lock(channel->recv_lock);
-        uint8_t buffer[256 * 1024];
-        size_t total_read = 0;
-        while (connected_.load() && !root->closed && !channel->closed &&
-               total_read < MAX_READ_PER_TICK) {
-            if (root->backpressure || !has_recv_room(root)) return;
-            const size_t free_budget = root->local_memory->available();
-            const size_t input_budget = channel->input.size() < MAX_INPUT_BUFFER
-                ? MAX_INPUT_BUFFER - channel->input.size() : 0;
-            if (free_budget == 0 || input_budget == 0) return;
-            const size_t request = std::min({sizeof(buffer), MAX_READ_PER_TICK - total_read,
-                                             free_budget, input_budget});
-            if (request == 0) return;
-            const size_t required = channel->input.size() + request;
-            if (required > MAX_INPUT_BUFFER || !ensure_input_capacity(*channel, required)) {
-                channel->memory_backpressure = true;
-                channel->blocked_memory_need = required;
-                return; // wait until queued messages are consumed and memory is released
+    bool has_pending_write(const std::shared_ptr<Conn>& conn) {
+        if (conn->wire_off < conn->wire.size()) return true;
+        std::lock_guard<std::mutex> lock(conn->mutex);
+        return !conn->sendq.empty();
+    }
+    void write_ready(const std::shared_ptr<Conn>& conn) {
+        if (conn->closed) return;
+        if (conn->wire_off >= conn->wire.size()) {
+            std::vector<uint8_t>().swap(conn->wire);
+            conn->wire_off = 0;
+            conn->wire_memory.reset();
+            Pending pending;
+            bool have_pending = false;
+            {
+                std::lock_guard<std::mutex> lock(conn->mutex);
+                if (!conn->sendq.empty()) {
+                    pending = std::move(conn->sendq.front());
+                    conn->sendq.pop_front();
+                    have_pending = true;
+                }
             }
-            channel->memory_backpressure = false;
-            channel->blocked_memory_need = 0;
+            if (!have_pending) return;
+            const size_t header_size = pending.authed ? AUTH_HEAD + EID_N : UNAUTH_HEAD;
+            const size_t frame_size = MAGIC_N + header_size + pending.payload.size() + MAGIC_N;
+            try {
+                conn->wire_memory = Lease::make(conn->global_memory, conn->local_memory, frame_size);
+            } catch (...) {
+                conn->closed = true;
+                conn->cv.notify_all();
+                return;
+            }
+            if (!conn->wire_memory) {
+                conn->closed = true;
+                conn->cv.notify_all();
+                return;
+            }
+            try {
+                conn->wire = make_frame(*conn, pending);
+            } catch (...) {
+                conn->closed = true;
+                conn->cv.notify_all();
+                return;
+            }
+        }
+        if (conn->wire_off >= conn->wire.size()) return;
+        const size_t amount = std::min(MAX_WRITE_PER_TICK, conn->wire.size() - conn->wire_off);
 #ifdef _WIN32
-            const int got = ::recv(channel->sock, reinterpret_cast<char*>(buffer),
+        const int sent = ::send(conn->sock,
+                                reinterpret_cast<const char*>(conn->wire.data() + conn->wire_off),
+                                static_cast<int>(amount), 0);
+#else
+#  ifdef MSG_NOSIGNAL
+        const ssize_t sent = ::send(conn->sock, conn->wire.data() + conn->wire_off,
+                                    amount, MSG_NOSIGNAL);
+#  else
+        const ssize_t sent = ::send(conn->sock, conn->wire.data() + conn->wire_off,
+                                    amount, 0);
+#  endif
+#endif
+        if (sent > 0) {
+            conn->wire_off += static_cast<size_t>(sent);
+            if (conn->wire_off == conn->wire.size()) {
+                std::vector<uint8_t>().swap(conn->wire);
+                conn->wire_off = 0;
+                conn->wire_memory.reset();
+            }
+            return;
+        }
+        if (sent < 0 && would_block(sockerr())) return;
+        conn->closed = true;
+        conn->cv.notify_all();
+    }
+    void read_ready(const std::shared_ptr<Conn>& conn) {
+        uint8_t buffer[16 * 1024];
+        size_t total_read = 0;
+        while (!conn->closed && total_read < MAX_READ_PER_TICK) {
+            if (conn->backpressure || !has_recv_room(conn)) return;
+            const size_t request = std::min(sizeof(buffer), MAX_READ_PER_TICK - total_read);
+#ifdef _WIN32
+            const int got = ::recv(conn->sock, reinterpret_cast<char*>(buffer),
                                    static_cast<int>(request), 0);
 #else
-            const ssize_t got = ::recv(channel->sock, buffer, request, 0);
+            const ssize_t got = ::recv(conn->sock, buffer, request, 0);
 #endif
             if (got > 0) {
                 total_read += static_cast<size_t>(got);
-                channel->input.insert(channel->input.end(), buffer, buffer + got);
                 try {
-                    const uint64_t id = root->connection_id;
-                    parse_buffered(channel, [&](bool authed, const std::string& eid,
-                                                uint64_t counter, std::string payload,
-                                                std::shared_ptr<Lease> memory) {
-                        return deliver_message(root, authed, eid, counter,
-                                               std::move(payload), std::move(memory), id);
+                    if (static_cast<size_t>(got) > MAX_INPUT_BUFFER - conn->input.size() ||
+                        !ensure_input_capacity(*conn, conn->input.size() + static_cast<size_t>(got))) {
+                        conn->closed = true;
+                        return;
+                    }
+                    conn->input.insert(conn->input.end(), buffer, buffer + got);
+                    const uint64_t id = conn->connection_id;
+                    parse_buffered(conn, [&](bool authed, const std::string& eid,
+                                             std::string payload, std::shared_ptr<Lease> memory) {
+                        return deliver_message(conn, authed, eid, std::move(payload),
+                                               std::move(memory), id);
                     });
-                    if (channel->memory_backpressure) return;
                 } catch (...) {
-                    mark_session_closed(channel);
-                    connected_ = false;
+                    conn->closed = true;
+                    conn->cv.notify_all();
                     return;
                 }
-                if (!has_recv_room(root)) return;
+                if (conn->closed || !has_recv_room(conn)) return;
                 continue;
             }
             if (got == 0) {
-                mark_session_closed(channel);
-                connected_ = false;
+                conn->closed = true;
+                conn->cv.notify_all();
                 return;
             }
             if (would_block(sockerr())) return;
-            mark_session_closed(channel);
-            connected_ = false;
+            conn->closed = true;
+            conn->cv.notify_all();
             return;
         }
     }
-    void write_ready(const std::shared_ptr<Conn>& root,
-                     const std::shared_ptr<Conn>& channel) {
-        std::lock_guard<std::mutex> channel_lock(channel->send_lock);
-        if (!connected_.load() || root->closed || channel->closed || channel->sock == BAD_SOCKET)
-            return;
-        write_channel_ready(root, channel);
-        if (root->closed || channel->closed) connected_ = false;
-    }
-    void send_loop(const std::shared_ptr<Conn>& root,
-                   const std::shared_ptr<Conn>& channel) noexcept {
-        while (connected_.load() && !root->closed && !channel->closed) {
+    void io_loop() noexcept {
+        auto conn = conn_;
+        if (!conn) return;
+        while (connected_.load() && !conn->closed) {
             try {
-                write_ready(root, channel);
-                if (!connected_.load() || root->closed || channel->closed) break;
-                if (channel->wire.empty()) {
-                    std::unique_lock<std::mutex> lock(root->mutex);
-                    root->cv.wait_for(lock, std::chrono::milliseconds(20));
-                    continue;
+                try {
+                    cleanup_exchanges(conn);
+                    if (!conn->input.empty() && has_recv_room(conn)) {
+                        const uint64_t id = conn->connection_id;
+                        parse_buffered(conn, [&](bool authed, const std::string& eid,
+                                                 std::string payload, std::shared_ptr<Lease> memory) {
+                            return deliver_message(conn, authed, eid, std::move(payload),
+                                                   std::move(memory), id);
+                        });
+                    }
+                } catch (...) {
+                    conn->closed = true;
+                    conn->cv.notify_all();
                 }
+                if (conn->closed || !connected_.load()) break;
+                short events = 0;
+                if (!conn->backpressure && has_recv_room(conn)) events |= POLLIN;
+                if (has_pending_write(conn)) events |= POLLOUT;
                 pollfd_t pfd{};
-                pfd.fd = channel->sock;
-                pfd.events = POLLOUT;
+                pfd.fd = conn->sock;
+                pfd.events = events;
                 const int rc = poll_many(&pfd, 1, IO_POLL_INTERVAL_MS);
                 if (rc < 0) {
                     if (interrupted_error(sockerr())) continue;
-                    mark_session_closed(channel);
-                    connected_ = false;
+                    conn->closed = true;
                     break;
                 }
-                if (rc > 0) {
-                    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                        mark_session_closed(channel);
-                        connected_ = false;
-                        break;
-                    }
-                    if (pfd.revents & POLLOUT) write_ready(root, channel);
+                if (rc == 0) continue;
+                if (pfd.revents & (POLLERR | POLLNVAL)) {
+                    conn->closed = true;
+                    break;
                 }
-            } catch (const std::exception& e) {
-                log_callback_error("client_send", e.what());
-                mark_session_closed(channel);
-                connected_ = false;
-            } catch (...) {
-                log_callback_error("client_send", "unknown exception");
-                mark_session_closed(channel);
-                connected_ = false;
-            }
-        }
-    }
-    void recv_loop(const std::shared_ptr<Conn>& root,
-                   const std::shared_ptr<Conn>& channel) noexcept {
-        while (connected_.load() && !root->closed && !channel->closed) {
-            try {
-                if (channel->channel_index == 0) cleanup_eid_activity(root);
-                if (!channel->input.empty() && has_recv_room(root)) {
-                    const uint64_t id = root->connection_id;
-                    parse_buffered(channel, [&](bool authed, const std::string& eid,
-                                                uint64_t counter, std::string payload,
-                                                std::shared_ptr<Lease> memory) {
-                        return deliver_message(root, authed, eid, counter,
-                                               std::move(payload), std::move(memory), id);
-                    });
-                }
-                if (!connected_.load() || root->closed || channel->closed) break;
-                if (channel->memory_backpressure &&
-                    root->local_memory->available() >= std::max<size_t>(16 * 1024, channel->blocked_memory_need.load())) {
-                    channel->memory_backpressure = false;
-                    channel->blocked_memory_need = 0;
-                }
-                if (root->backpressure || channel->memory_backpressure || !has_recv_room(root)) {
-                    std::unique_lock<std::mutex> lock(root->mutex);
-                    root->cv.wait_for(lock, std::chrono::milliseconds(20));
+                if ((pfd.revents & POLLHUP) && !(pfd.events & POLLIN) &&
+                    !(pfd.events & POLLOUT))
                     continue;
-                }
-                pollfd_t pfd{};
-                pfd.fd = channel->sock;
-                pfd.events = POLLIN;
-                const int rc = poll_many(&pfd, 1, IO_POLL_INTERVAL_MS);
-                if (rc < 0) {
-                    if (interrupted_error(sockerr())) continue;
-                    mark_session_closed(channel);
-                    connected_ = false;
+                if (pfd.revents & POLLOUT) write_ready(conn);
+                if (!conn->closed && (pfd.revents & POLLIN)) read_ready(conn);
+                if (!conn->closed && (pfd.revents & POLLHUP) &&
+                    (pfd.events & POLLIN) && !(pfd.revents & POLLIN)) {
+                    conn->closed = true;
                     break;
                 }
-                if (rc > 0) {
-                    if (pfd.revents & (POLLERR | POLLNVAL)) {
-                        mark_session_closed(channel);
-                        connected_ = false;
-                        break;
-                    }
-                    if (pfd.revents & POLLIN) read_ready(root, channel);
-                    if (!root->closed && (pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
-                        mark_session_closed(channel);
-                        connected_ = false;
-                        break;
-                    }
-                }
             } catch (const std::exception& e) {
-                log_callback_error("client_recv", e.what());
-                mark_session_closed(channel);
-                connected_ = false;
+                log_callback_error("client_io", e.what());
+                conn->closed = true;
             } catch (...) {
-                log_callback_error("client_recv", "unknown exception");
-                mark_session_closed(channel);
-                connected_ = false;
+                log_callback_error("client_io", "unknown exception");
+                conn->closed = true;
             }
         }
+        connected_ = false;
+        clear_conn_io_state(conn);
     }
     std::string host_;
     uint16_t port_;
@@ -2686,15 +2125,14 @@ private:
     std::string magic2_;
     std::atomic<bool> connected_{false};
     std::atomic<bool> stopping_{false};
+    std::thread io_thread_;
 };
 }
 PYBIND11_MODULE(backend, m) {
-    m.doc() = "Networking v3.2 five-channel queued TCP backend (sliding EID callback window)";
+    m.doc() = "Networking v2.0 queued TCP backend (resource-hardened)";
     m.attr("MAX_UNAUTH_PAYLOAD") = MAX_UNAUTH;
     m.attr("MAX_AUTH_PAYLOAD") = MAX_AUTH;
     m.attr("QUEUE_LIMIT") = QUEUE_LIMIT;
-    m.attr("RECV_QUEUE_LIMIT") = RECV_QUEUE_LIMIT;
-    m.attr("CHANNEL_COUNT") = CHANNEL_COUNT;
     py::class_<Server>(m, "Server")
         .def(py::init<std::string, uint16_t, py::object, py::object, size_t, size_t, py::object>(),
              py::arg("host"), py::arg("port"),
